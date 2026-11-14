@@ -5,7 +5,7 @@ implements `toolkit/modules/autosolve.py` against this document verbatim. Where
 this spec and `PLAN.md` disagree, `PLAN.md`'s hard constraints and quality bar
 win; everything else here is binding for `autosolve`.
 
-> **Status: SPECCED (2026-11-14)** — not implemented.
+> **Status: IMPLEMENTED (2026-11-14)** — `toolkit/modules/autosolve.py` (issue #50).
 
 Keywords: **MUST** = required for acceptance (selftest or review gate).
 **SHOULD** = expected; omit only with a written reason in the PR body.

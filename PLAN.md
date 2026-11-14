@@ -4,8 +4,8 @@ Planning artifact for `toolkit/`. Sonnet-run issues implement one module per PR
 against this plan.
 
 > **Status: COMPLETE (2026-11-14).** All 16 modules (6 original + 10 expansion)
-> plus the flagship `revauto` (17 total) are IMPLEMENTED; `python3 toolkit/recon.py --selftest` reports
-> `17/17 modules passed`. Re-integration pass: #42. The optional menu-scaling
+> plus the flagships `revauto` and `autosolve` (18 total) are IMPLEMENTED; `python3 toolkit/recon.py --selftest` reports
+> `18/18 modules passed`. Re-integration pass: #42. The optional menu-scaling
 > extras (`CATEGORY` grouping, `recon.py --list`) were not built — see
 > "Menu / README scaling" below.
 
@@ -262,6 +262,15 @@ The full spec, data model, selftest plan and acceptance criteria live in
 [`PLAN-revauto.md`](PLAN-revauto.md) (it is too large for this file). It is
 held to every rule in this document; on conflict, the hard constraints and
 quality bar here win. When implemented, the global selftest becomes `17/17`.
+
+## Flagship: `autosolve` — IMPLEMENTED (issues #48 spec, #50 implementation)
+
+| # | module | prio | status | one-liner | depends on |
+|---|--------|------|--------|-----------|-----------|
+| 12 | `autosolve` | **P0 / flagship** | IMPLEMENTED | flag-checker auto-solver for x86 / x86-64 ELF: verdict strings -> deciding branch -> ordered constraints (built-in decoder + bounded path walker) -> derived flag with static re-walk verification, exact patch + `elfpatch` commands, or next steps; optional angr lane; never executes the target | disasm, elfpatch, pwnhelp, revauto, gdbkit, batch |
+
+The full spec, data model, selftest plan (S1-S17) and acceptance criteria live in
+[`PLAN-autosolve.md`](PLAN-autosolve.md). With it the global selftest is `18/18`.
 
 ---
 

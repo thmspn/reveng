@@ -8,8 +8,12 @@ Design, module boundaries and the quality bar every module meets are in [`PLAN.m
 Python 3.9+ (Kali default is fine). Standard library first; optional libs (capstone, pyelftools, pwntools)
 are only used via guarded `try/except ImportError` imports with a stdlib fallback (today: `disasm`/`shellcode` use
 capstone when present, hex view otherwise; `hashid` verifies bcrypt/sha*crypt only if `bcrypt`/`passlib` is present;
-`stego` uses `PIL` for non-PNG/BMP formats when present). External tools (objdump, r2, ropper, ROPgadget, gdb) are opt-in
+`stego` uses `PIL` for non-PNG/BMP formats when present; `autosolve` has its own x86 decoder and only uses capstone for listing text). External tools (objdump, r2, ropper, ROPgadget, gdb) are opt-in
 "external-tool mode", gated by `shutil.which`; `revauto` additionally uses radare2 (`r2pipe` if importable, else `r2 -2` subprocess) and Ghidra `analyzeHeadless` as opt-in binary engines (never required; stdlib fallback otherwise); `apk` only *suggests* apktool/jadx commands, never runs them.
+`angr` is an optional, pre-installed extra for `autosolve`'s symbolic lane only: it is runtime-detected (never imported by the toolkit
+process; it runs in a timeout-bounded child) and absent by default. Install it **before the event** (needs network):
+`pip install angr`, or on Kali (PEP 668) `python3 -m venv ~/angr-venv && ~/angr-venv/bin/pip install angr` and then run the
+toolkit with `~/angr-venv/bin/python3 toolkit/recon.py ...`. Without it `autosolve` prints one skip line and everything else is unchanged.
 
 ## Run
 Run from the `toolkit/` directory (or prefix paths with `toolkit/`).
@@ -46,6 +50,7 @@ Exit codes everywhere: `0` success, `1` runtime/analysis failure (bad input, fil
 | apk | offline Android static analysis via stdlib `zipfile`: confirms `AndroidManifest.xml`, extracts strings from `classes*.dex`/`resources.arsc`/`res`/`assets`, dumps `META-INF` + signing-cert blocks (SHA-256, DN strings), keyword + URL hunt (reuses `forensics.find_keywords`). If `apktool`/`jadx` are on PATH the exact command is only *suggested* (never run, never downloaded). `recon.py apk <file.apk> [--strings] [--certs]` |
 | stego | offline hidden-data finder: LSB extraction from PNG/BMP (stdlib `zlib`/`struct`, optional `PIL` for other formats; configurable channels/bits, bit order), appended/trailing-bytes detection after PNG IEND / JPEG EOI / GIF trailer / BMP size, polyglot + embedded-archive carve (reuses `binextras.MAGICS`, local fallback table), bit-plane ASCII dump, palette anomaly report. Complements `forensics` (metadata). `recon.py stego <img> [--lsb] [--append] [--carve] [--palette] [--plane N]` |
 | revauto | automated RE analyst: auto-detects and unwraps obfuscated Python/JS/shell layers (base64/zlib/hex/char-code/lambda/marshal/pickle/packer/pipe-to-sh) with pure transforms only -- never executes the payload; labels every function/block with what it does (network, file, exec, crypto, persistence, ...), IOCs, tells with line refs, flag-checker solver; ELF/PE digest via radare2 (r2pipe or r2 -2 subprocess) or ghidra analyzeHeadless when present, else a stdlib fallback (protections, imports by category, functions, strings+xrefs, crypto constants, anti-debug, syscalls). `recon.py revauto <file\|-> [--deep] [--json] [--engine auto\|r2\|ghidra\|none] [--dump-layers DIR]` |
+| autosolve | flag-checker auto-solver: finds success/failure verdict strings and their references (x64 RIP-relative, absolute imm32, i386 push), traces back to the deciding branch, walks the checker with a built-in x86 decoder (capstone optional, presentation only) to extract ordered constraints (length, byte compares, xor/add/sub/rol chains, table lookups, strcmp/memcmp literals), prints the derived flag with confidence + static re-walk verification, or the exact jcc patch with ready elfpatch commands, or next steps; optional angr lane (runtime-detected, timeout-bounded child). Never executes the target. `recon.py autosolve [find-verdicts\|trace\|constraints\|listing\|solve\|patch\|angr] <elf> [--success RE] [--fail RE] [--json] [--deep] [--no-angr]` |
 
 ## Adding a module
 Drop `modules/<name>.py` defining `NAME`, `DESCRIPTION`, `run(args) -> int`, `selftest() -> bool`.
