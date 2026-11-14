@@ -47,6 +47,10 @@ DF_BIND_NOW, DF_1_NOW = 0x8, 0x1
 SHT_NOBITS = 8
 
 
+_FLAG_RE = re.compile(rb"[A-Za-z0-9_\-]{2,24}\{[\x21-\x7a\x7c\x7e]{1,200}\}")
+_FLAG_SCAN_CAP = 64 << 20  # bytes scanned for flag-shaped strings
+
+
 def detect_type(data: bytes) -> str:
     """Identify file type from magic bytes; fall back to text/data by content."""
     for magic, name in MAGICS:
@@ -255,6 +259,16 @@ def analyze(data: bytes, min_len: int = 4, max_strings: int = 200, show_strings:
     out += [f"{n:<8} {h}" for n, h in hashes(data).items()]
     total = entropy(data)
     out.append(f"entropy: {total:.3f} bits/byte - {entropy_note(total, len(data))}")
+
+    # Whole-file flag grep first: flags buried past the strings cap must still surface
+    # (battery ic-61: literal flag at line 933 of a 108 KB text file).
+    flags = sorted({m.group().decode("ascii", "replace")
+                    for m in _FLAG_RE.finditer(data[: _FLAG_SCAN_CAP])})
+    if flags:
+        out.append(f"flag-shaped strings ({len(flags)}):")
+        out += [f"  [FLAG?] {f}" for f in flags[:25]]
+        if len(flags) > 25:
+            out.append(f"  ... {len(flags) - 25} more")
 
     if data.startswith(b"\x7fELF"):
         out.append("\n-- ELF --")
