@@ -289,6 +289,7 @@ def _lcg_bytes(n: int, seed: int = 12345) -> bytes:
 
 
 def selftest() -> bool:
+    """Registry contract self-test: XOR/Vigenere breaks, ECB detect, freq stats, substitution helper."""
     ok = True
 
     def check(name: str, cond: bool, extra: str = "") -> None:
@@ -346,6 +347,7 @@ Use '-' as the argument to read from stdin."""
 
 
 def run(args: list[str]) -> int:
+    """CLI entry point (registry contract); returns a process exit code."""
     if not args or args[0] in ("-h", "--help"):
         print(_USAGE)
         return 0

@@ -3,9 +3,11 @@ JPEG/PNG/PDF metadata (best-effort) and magic-header repair. Pure stdlib, offlin
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import os
 import re
-import socket
+import socket  # address formatting only (inet_ntoa/ntop/aton); no socket I/O is ever performed
 import struct
 import sys
 import zlib
@@ -131,11 +133,14 @@ def parse_pcap(data: bytes) -> list[dict]:
     else:
         it = _read_pcap(data)
     pkts = []
-    for n, (ts, link, fr) in enumerate(it, 1):
-        d = parse_frame(link, fr) or {"src": "?", "dst": "?", "proto": "other", "sport": 0, "dport": 0,
-                                       "seq": 0, "flags": 0, "data": b""}
-        d.update(no=n, ts=ts, length=len(fr))
-        pkts.append(d)
+    try:
+        for n, (ts, link, fr) in enumerate(it, 1):
+            d = parse_frame(link, fr) or {"src": "?", "dst": "?", "proto": "other", "sport": 0, "dport": 0,
+                                           "seq": 0, "flags": 0, "data": b""}
+            d.update(no=n, ts=ts, length=len(fr))
+            pkts.append(d)
+    except (struct.error, IndexError) as exc:  # truncated capture header/record
+        raise ValueError(f"truncated/malformed capture: {exc}") from exc
     return pkts
 
 
@@ -406,6 +411,9 @@ def _print_pcap(rep: dict, a) -> None:
 
 
 def run(args: list[str]) -> int:
+    """CLI entry point (registry contract); returns a process exit code."""
+    if args[:1] == ["selftest"]:
+        return 0 if selftest() else 1
     p = argparse.ArgumentParser(prog="recon.py forensics", description=DESCRIPTION)
     p.add_argument("file", nargs="?")
     p.add_argument("--packets", action="store_true", help="list packets")
@@ -417,12 +425,24 @@ def run(args: list[str]) -> int:
     p.add_argument("--repair", metavar="TYPE", help="fix magic header to TYPE (e.g. png); needs -o")
     p.add_argument("-o", "--out")
     p.add_argument("--selftest", action="store_true")
-    a = p.parse_args(args)
+    try:
+        a = p.parse_args(args)
+    except SystemExit as exc:  # -h -> 0, usage error -> 2; return instead of exiting
+        return exc.code if isinstance(exc.code, int) else 2
     if a.selftest:
         return 0 if selftest() else 1
     if not a.file:
         p.print_help()
+        return 0
+    try:
+        return _dispatch(a)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 1
+
+
+def _dispatch(a: argparse.Namespace) -> int:
+    """Execute one parsed forensics invocation; I/O and parse errors propagate to run()."""
     with open(a.file, "rb") as fh:
         data = fh.read()
     if a.repair:
@@ -475,6 +495,7 @@ def make_test_pcap() -> bytes:
 
 
 def selftest() -> bool:
+    """Registry contract self-test: pcap/pcapng/streams/HTTP, metadata and repair on in-memory fixtures."""
     ok: list[bool] = []
 
     def check(name, cond):
@@ -504,6 +525,12 @@ def selftest() -> bool:
         ng += blk(6, struct.pack("<IIIII", 0, 0, 1, len(fr), len(fr)) + fr)
     check("pcapng: parses same packets", [p["length"] for p in parse_pcap(ng)] == [p["length"] for p in rep["packets"]])
     check("pcap: garbage rejected", _raises(lambda: parse_pcap(b"notapcapfile" * 4)))
+    try:
+        parse_pcap(b"\xd4\xc3\xb2\xa1\x00")
+        trunc_ok = False
+    except ValueError:
+        trunc_ok = True
+    check("pcap: truncated header -> ValueError (no struct.error leak)", trunc_ok)
 
     jpg = b"\xff\xd8\xff\xe1\x00\x10Exif\0\0II*\0\x08\x00\xff\xd9"  # truncated EXIF
     check("exif: truncated JPEG handled gracefully", isinstance(jpeg_exif(jpg), dict))
@@ -526,6 +553,9 @@ def selftest() -> bool:
     f, _ = repair_header(png[8:], "png")
     check("repair: missing magic prepended", f == png)
     check("repair: unknown type raises", _raises(lambda: repair_header(b"x", "nope")))
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        codes = (run([]), run(["-h"]), run(["--bogus"]), run(["/nonexistent/x.pcap"]))
+    check("cli: bare/-h -> 0, bad flag -> 2, missing file -> 1", codes == (0, 0, 2, 1))
     return all(ok)
 
 

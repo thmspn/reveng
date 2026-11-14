@@ -5,6 +5,8 @@ subprocess-wrapped extras (shutil.which-gated) layered on top of the pure-Python
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import shutil
 import struct
 import subprocess
@@ -85,6 +87,14 @@ def parse_elf_sections(data: bytes) -> list[ElfSection]:
     virtual address, file offset, size and flags (enough to locate executable bytes)."""
     if data[:4] != b"\x7fELF":
         raise ValueError("not an ELF file")
+    try:
+        return _parse_elf_sections(data)
+    except (struct.error, IndexError) as exc:
+        raise ValueError(f"truncated/malformed ELF: {exc}") from exc
+
+
+def _parse_elf_sections(data: bytes) -> list[ElfSection]:
+    """Body of parse_elf_sections(); may raise struct.error on truncated input."""
     ei_class = data[4]
     is64 = ei_class == 2
     endian = "<" if data[5] == 1 else ">"
@@ -340,6 +350,7 @@ def hexdump(data: bytes, width: int = 16, start: int = 0) -> str:
 # --------------------------------------------------------------------------- CLI
 
 def run(args: list[str]) -> int:
+    """CLI entry point (registry contract); returns a process exit code."""
     p_ = argparse.ArgumentParser(prog="recon.py binextras", description=DESCRIPTION)
     sub = p_.add_subparsers(dest="cmd")
 
@@ -369,15 +380,27 @@ def run(args: list[str]) -> int:
     hd.add_argument("-o", "--offset", type=lambda x: int(x, 0), default=0)
     hd.add_argument("-l", "--length", type=lambda x: int(x, 0))
 
+    sub.add_parser("selftest", help="run the module self-test")
     p_.add_argument("--selftest", action="store_true")
-    a = p_.parse_args(args)
+    try:
+        a = p_.parse_args(args)
+    except SystemExit as exc:  # -h -> 0, usage error -> 2; return instead of exiting
+        return exc.code if isinstance(exc.code, int) else 2
 
-    if a.selftest or a.cmd is None:
-        if a.selftest:
-            return 0 if selftest() else 1
+    if a.selftest or a.cmd == "selftest":
+        return 0 if selftest() else 1
+    if a.cmd is None:
         p_.print_help()
+        return 0
+    try:
+        return _dispatch(a)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 1
 
+
+def _dispatch(a: argparse.Namespace) -> int:
+    """Execute one parsed binextras subcommand; I/O and parse errors propagate to run()."""
     if a.cmd == "cyclic":
         sys.stdout.buffer.write(cyclic(a.length, n=a.n))
         sys.stdout.write("\n")
@@ -505,6 +528,7 @@ def _make_test_elf() -> tuple[bytes, int]:
 
 
 def selftest() -> bool:
+    """Registry contract self-test: cyclic, gadgets, carving, pack/unpack, hexdump (all in memory)."""
     ok: list[bool] = []
 
     def check(name, cond):
@@ -544,6 +568,15 @@ def selftest() -> bool:
     check("gadget: leave; ret found", by_addr.get(addrs["leave_ret"], {}).get("kind") == "leave_ret")
     check("gadget: REX pop r15; ret found", by_addr.get(addrs["pop_r15"], {}).get("asm") == "pop r15; ret")
     check("elf: malformed input raises", _raises(lambda: parse_elf_sections(b"not an elf")))
+    try:
+        parse_elf_sections(b"\x7fELF\x02\x01")
+        truncated_ok = False
+    except ValueError:
+        truncated_ok = True
+    check("elf: truncated header raises ValueError (no struct.error leak)", truncated_ok)
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        cli_codes = (run([]), run(["-h"]), run(["zzbogus"]), run(["scan", "/nonexistent/x"]))
+    check("cli: bare/-h -> 0, unknown -> 2, missing file -> 1", cli_codes == (0, 0, 2, 1))
     check("external: unknown tool returns None (optional, no crash)",
           external_gadget_scan("/nonexistent/path", "ropper") is None or shutil.which("ropper") is not None)
 

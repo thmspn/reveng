@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import io
 import math
 import os
 import re
@@ -304,13 +306,21 @@ def analyze(data: bytes, min_len: int = 4, max_strings: int = 200, show_strings:
 
 
 def run(args: list[str]) -> int:
-    """CLI entry point."""
+    """CLI entry point (registry contract); returns a process exit code."""
+    if args[:1] == ["selftest"]:
+        return 0 if selftest() else 1
     p = argparse.ArgumentParser(prog="recon.py triage", description=DESCRIPTION)
     p.add_argument("path", help="file to analyze")
     p.add_argument("-n", "--min-len", type=int, default=4, help="minimum string length (default 4)")
     p.add_argument("--max-strings", type=int, default=200, help="max strings printed per encoding (default 200)")
     p.add_argument("--no-strings", action="store_true", help="skip string extraction")
-    ns = p.parse_args(args)
+    if not args:
+        p.print_help()
+        return 0
+    try:
+        ns = p.parse_args(args)
+    except SystemExit as exc:  # -h -> 0, usage error -> 2; return instead of exiting
+        return exc.code if isinstance(exc.code, int) else 2
     try:
         with open(ns.path, "rb") as fh:
             data = fh.read()
@@ -412,6 +422,9 @@ def selftest() -> bool:
               ("ASCII text" in rep or "script (shebang)" in rep) and "sha256" in rep and "def " in rep)
 
     check("packed heuristic", entropy_note(7.9) == "likely packed/encrypted")
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        codes = (run([]), run(["-h"]), run(["--bogus"]), run(["/nonexistent/x"]))
+    check("cli: bare/-h -> 0, bad flag -> 2, missing file -> 1", codes == (0, 0, 2, 1))
     return all(ok for _, ok in results)
 
 

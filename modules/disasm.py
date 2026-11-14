@@ -1,6 +1,8 @@
 """disasm: x86/x64 ELF disassembly helpers (offline; capstone optional)."""
 from __future__ import annotations
 
+import contextlib
+import io
 import shutil
 import struct
 import subprocess
@@ -250,7 +252,8 @@ def _load(path: str):
 
 
 def run(args: list[str]) -> int:
-    if not args:
+    """CLI entry point (registry contract); returns a process exit code."""
+    if not args or args[0] in ("-h", "--help"):
         print(USAGE)
         return 0
     cmd, rest = args[0], args[1:]
@@ -330,6 +333,7 @@ def build_test_elf() -> bytes:
 
 
 def selftest() -> bool:
+    """Registry contract self-test: syscall table, ELF parse, disasm/entry/xref paths on an in-memory ELF."""
     ok = True
 
     def check(name, cond):
@@ -361,6 +365,9 @@ def selftest() -> bool:
     except ElfError:
         check("reject non-ELF", True)
     check("external shortcuts returns list", isinstance(external_shortcuts("x"), list))
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        codes = (run([]), run(["-h"]), run(["zzbogus"]), run(["text", "/nonexistent/x"]))
+    check("cli: bare/-h -> 0, unknown -> 2, missing file -> 1", codes == (0, 0, 2, 1))
     print("selftest:", "OK" if ok else "FAILED")
     return ok
 

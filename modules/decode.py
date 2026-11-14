@@ -7,6 +7,8 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import contextlib
+import io
 import re
 import string
 import sys
@@ -372,7 +374,9 @@ def _parse_key(k: str) -> bytes:
 
 
 def run(args: list[str]) -> int:
-    """CLI entry point."""
+    """CLI entry point (registry contract); returns a process exit code."""
+    if args[:1] == ["selftest"]:
+        return 0 if selftest() else 1
     p = argparse.ArgumentParser(prog="recon.py decode", description=DESCRIPTION,
                                 epilog="With no mode flag: hints + auto multi-round decode (+ rot/xor fallbacks).")
     p.add_argument("input", nargs="*", help="text to process (or use -f / stdin)")
@@ -390,7 +394,13 @@ def run(args: list[str]) -> int:
     g.add_argument("--xor-key", metavar="KEY", help="repeating-key XOR; KEY text, or 0xHEX")
     g.add_argument("--hints", action="store_true", help="only print cipher-ID hints")
     p.add_argument("--top", type=int, default=5, help="candidates to show (default 5)")
-    ns = p.parse_args(args)
+    if not args and sys.stdin.isatty():  # bare invocation, nothing piped: show usage
+        p.print_help()
+        return 0
+    try:
+        ns = p.parse_args(args)
+    except SystemExit as exc:  # -h -> 0, usage error -> 2; return instead of exiting
+        return exc.code if isinstance(exc.code, int) else 2
     if ns.rot is not None:
         # --rot takes an optional value as a string so a following non-numeric
         # token is treated as input (brute-force), while "--rot 5"/"--rot=5" is a shift.
@@ -535,6 +545,9 @@ def selftest() -> bool:
     check("hint binary", any("binary" in h for h in hints("01001000 01101001")))
     check("hint base32", any("base32" in h for h in hints("JBSWY3DPEBLW64TMMQ======")))
     check("hint url", any("url" in h for h in hints("a%20b")))
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        codes = (run(["-h"]), run(["--bogus"]), run(["-f", "/nonexistent/x"]))
+    check("cli: -h -> 0, bad flag -> 2, missing file -> 1", codes == (0, 2, 1))
     return all(results)
 
 
