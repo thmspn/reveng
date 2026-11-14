@@ -138,7 +138,13 @@ def run(args: list[str]) -> int:
     p.add_argument("--strings", action="store_true", help="print all extracted strings")
     p.add_argument("--certs", action="store_true", help="dump META-INF / certificate info")
     p.add_argument("--min", type=int, default=6, help="minimum string length (default 6)")
-    a = p.parse_args(args)
+    if not args:  # bare invocation: usage + 0 (PLAN.md quality bar)
+        p.print_help()
+        return 0
+    try:
+        a = p.parse_args(args)
+    except SystemExit as exc:  # argparse usage error -> 2, -h -> 0; no exit from inside run()
+        return exc.code if isinstance(exc.code, int) else 0
     try:
         with open(a.apk, "rb") as f:
             data = f.read()
@@ -192,6 +198,11 @@ def selftest() -> bool:
         check("bad zip raises", False)
     except zipfile.BadZipFile:
         pass
+    # CLI exit-code contract: bare/-h -> 0, unknown subcommand -> 2 (help text silenced)
+    import contextlib
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        codes = (run([]), run(["-h"]), run(["--bogus-flag"]))
+    check("cli: bare/-h -> 0, unknown -> 2", codes == (0, 0, 2))
     return ok
 
 

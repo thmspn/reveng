@@ -1,16 +1,18 @@
 # RE toolkit (offline)
 
-Helper scripts for CTF reversing (ELF crackmes, packed/obfuscated binaries).
+Helper scripts for jeopardy CTFs: reversing/pwn, crypto, forensics/stego and web (16 modules, see below).
 **100% offline**: no network calls, no telemetry, no runtime installs. Python 3 standard library first.
 Design, module boundaries and the quality bar every module meets are in [`PLAN.md`](PLAN.md).
 
 ## Requirements
 Python 3.9+ (Kali default is fine). Standard library first; optional libs (capstone, pyelftools, pwntools)
 are only used via guarded `try/except ImportError` imports with a stdlib fallback (today: `disasm`/`shellcode` use
-capstone when present, hex view otherwise; `hashid` verifies bcrypt/sha*crypt only if `bcrypt`/`passlib` is present). External tools (objdump, r2, ropper, ROPgadget) are opt-in
-"external-tool mode", gated by `shutil.which`.
+capstone when present, hex view otherwise; `hashid` verifies bcrypt/sha*crypt only if `bcrypt`/`passlib` is present;
+`stego` uses `PIL` for non-PNG/BMP formats when present). External tools (objdump, r2, ropper, ROPgadget, gdb) are opt-in
+"external-tool mode", gated by `shutil.which`; `apk` only *suggests* apktool/jadx commands, never runs them.
 
 ## Run
+Run from the `toolkit/` directory (or prefix paths with `toolkit/`).
 ```
 python3 recon.py                    # interactive numbered menu
 python3 recon.py triage ./binary    # run one module directly
@@ -43,7 +45,6 @@ Exit codes everywhere: `0` success, `1` runtime/analysis failure (bad input, fil
 | pwnhelp | exploitation arithmetic: `p64`/`u64`/`p32`/`u32` packing, format-string offset finder (locates the controlled `%N$p` position from a leaked `%p` dump + known marker), local-libc symbol-table reader (`.dynsym`/`.symtab`) with libc-base-from-leak / symbol-or-raw-offset (one-gadget) / `"/bin/sh"` runtime-address math, GOT/PLT lister (`.rela.plt` symbol -> GOT slot, built on `disasm.parse_elf`). Reads only a *local* libc/ELF file, never downloads one. `recon.py pwnhelp <pack\|unpack\|fmtoffset\|symbols\|libcbase\|libcaddr\|binsh\|gotplt\|selftest> ...` |
 | apk | offline Android static analysis via stdlib `zipfile`: confirms `AndroidManifest.xml`, extracts strings from `classes*.dex`/`resources.arsc`/`res`/`assets`, dumps `META-INF` + signing-cert blocks (SHA-256, DN strings), keyword + URL hunt (reuses `forensics.find_keywords`). If `apktool`/`jadx` are on PATH the exact command is only *suggested* (never run, never downloaded). `recon.py apk <file.apk> [--strings] [--certs]` |
 | stego | offline hidden-data finder: LSB extraction from PNG/BMP (stdlib `zlib`/`struct`, optional `PIL` for other formats; configurable channels/bits, bit order), appended/trailing-bytes detection after PNG IEND / JPEG EOI / GIF trailer / BMP size, polyglot + embedded-archive carve (reuses `binextras.MAGICS`, local fallback table), bit-plane ASCII dump, palette anomaly report. Complements `forensics` (metadata). `recon.py stego <img> [--lsb] [--append] [--carve] [--palette] [--plane N]` |
-
 
 ## Adding a module
 Drop `modules/<name>.py` defining `NAME`, `DESCRIPTION`, `run(args) -> int`, `selftest() -> bool`.

@@ -1,7 +1,13 @@
 # Master Module Plan — Offline CTF RE Toolkit
 
 Planning artifact for `toolkit/`. Sonnet-run issues implement one module per PR
-against this plan. **No module code lives in this PR.**
+against this plan.
+
+> **Status: COMPLETE (2026-11-14).** All 16 modules (6 original + 10 expansion)
+> are IMPLEMENTED and merged; `python3 toolkit/recon.py --selftest` reports
+> `16/16 modules passed`. Re-integration pass: #42. The optional menu-scaling
+> extras (`CATEGORY` grouping, `recon.py --list`) were not built — see
+> "Menu / README scaling" below.
 
 Target event: CyberSci regionals, **Nov 21** — 4-hour jeopardy CTF (reversing,
 crypto, forensics, web). Target host: Kali VM, Python 3, stdlib-first.
@@ -33,19 +39,19 @@ Each `modules/<name>.py` exposes module-level:
 and `recon.py --selftest`. A new module needs **zero** changes to `recon.py` —
 just drop the file in `modules/`.
 
-## Already built / in flight — DO NOT re-plan; design around
+## Base modules — IMPLEMENTED
 
 | module | status | owns |
 |--------|--------|------|
-| `triage` | merged (PR #6 scaffold) | file type, hashes, strings, entropy, ELF/PE headers + checksec-style protections |
-| `decode` | merged | base-N / hex / url / rot / atbash / vigenere(key) / XOR brute, multi-round auto-decode |
-| `disasm` | merged | x86/x64 ELF `.text` disasm (capstone-opt), entry, call/string xrefs, syscall + opcode tables, objdump/r2 shell-out |
-| `crypto` | merged | freq analysis, repeating-XOR / Vigenere break, ECB detect, substitution helper |
-| `forensics` | merged | pcap parse / TCP streams / HTTP objects / keyword hunt, JPEG-EXIF / PNG / PDF metadata, magic-header repair |
-| `binextras` | merged | cyclic patterns, ROP gadget finder, binwalk-style carving |
-| `batch` | merged (P0) | directory auto-triage; routes to triage/forensics/disasm/decode via the registry |
-| `hashid` | merged (P0) | credential-hash identification + offline dictionary crack |
-| `shellcode` | merged (P0) | badchars, XOR encoders, format converters, reference stubs |
+| `triage` | IMPLEMENTED (PR #6 scaffold) | file type, hashes, strings, entropy, ELF/PE headers + checksec-style protections |
+| `decode` | IMPLEMENTED | base-N / hex / url / rot / atbash / vigenere(key) / XOR brute, multi-round auto-decode |
+| `disasm` | IMPLEMENTED | x86/x64 ELF `.text` disasm (capstone-opt), entry, call/string xrefs, syscall + opcode tables, objdump/r2 shell-out |
+| `crypto` | IMPLEMENTED | freq analysis, repeating-XOR / Vigenere break, ECB detect, substitution helper |
+| `forensics` | IMPLEMENTED | pcap parse / TCP streams / HTTP objects / keyword hunt, JPEG-EXIF / PNG / PDF metadata, magic-header repair |
+| `binextras` | IMPLEMENTED | cyclic patterns, ROP gadget finder, binwalk-style carving |
+| `batch` | IMPLEMENTED (P0) | directory auto-triage; routes to triage/forensics/disasm/decode via the registry |
+| `hashid` | IMPLEMENTED (P0) | credential-hash identification + offline dictionary crack |
+| `shellcode` | IMPLEMENTED (P0) | badchars, XOR encoders, format converters, reference stubs |
 
 **Boundary rules so the expansion does not collide:**
 - Shellcode work goes in `shellcode` (new), not `disasm`. `disasm` reads;
@@ -67,18 +73,18 @@ category. **P2** = nice-to-have / narrower.
 
 ### Priority table
 
-| # | module | prio | one-liner | depends on |
-|---|--------|------|-----------|-----------|
-| 1 | `batch` | **P0** | auto-triage a whole challenge directory, routing each file to the right module | triage, forensics, disasm |
-| 2 | `hashid` | **P0** | identify hash type + offline dictionary crack (rockyou path on Kali) | — |
-| 3 | `shellcode` | **P0** | badchar checker, XOR/alnum encoder, hex↔raw, skeleton stubs | disasm (tables) |
-| 4 | `gdbkit` | **P1** | emit ready-to-paste gdb / gef / pwndbg command recipes + a scripted run driver | — |
-| 5 | `elfpatch` | **P1** | byte/NOP/jump patching, entry redirect, section dump/replace | triage, disasm |
-| 6 | `webkit` | **P1** | JWT decode + alg-none/weak-secret check, offline fuzz/wordlist gen, hash/cookie helpers | hashid |
-| 7 | `exploitnotes` | **P1** | searchable offline cheatsheet: ROP/ret2libc/fmt-string/heap recipes, syscall & one-gadget hints | — |
-| 8 | `pwnhelp` | **P2** | format-string offset finder, GOT/PLT lister, libc-offset calculator from a local libc | disasm, elfpatch |
-| 9 | `apk` | **P2** | unzip APK, dump manifest/strings/certs, optional apktool/jadx shell-out | triage |
-| 10 | `stego` | **P2** | LSB extract, appended-data / polyglot finder, bit-plane + palette dumps | forensics |
+| # | module | prio | status | one-liner | depends on |
+|---|--------|------|--------|-----------|-----------|
+| 1 | `batch` | **P0** | IMPLEMENTED | auto-triage a whole challenge directory, routing each file to the right module | triage, forensics, disasm |
+| 2 | `hashid` | **P0** | IMPLEMENTED | identify hash type + offline dictionary crack (rockyou path on Kali) | — |
+| 3 | `shellcode` | **P0** | IMPLEMENTED | badchar checker, XOR/alnum encoder, hex↔raw, skeleton stubs | disasm (tables) |
+| 4 | `gdbkit` | **P1** | IMPLEMENTED | emit ready-to-paste gdb / gef / pwndbg command recipes + a scripted run driver | — |
+| 5 | `elfpatch` | **P1** | IMPLEMENTED | byte/NOP/jump patching, entry redirect, section dump/replace | triage, disasm |
+| 6 | `webkit` | **P1** | IMPLEMENTED | JWT decode + alg-none/weak-secret check, offline fuzz/wordlist gen, hash/cookie helpers | hashid |
+| 7 | `exploitnotes` | **P1** | IMPLEMENTED | searchable offline cheatsheet: ROP/ret2libc/fmt-string/heap recipes, syscall & one-gadget hints | — |
+| 8 | `pwnhelp` | **P2** | IMPLEMENTED | format-string offset finder, GOT/PLT lister, libc-offset calculator from a local libc | disasm, elfpatch |
+| 9 | `apk` | **P2** | IMPLEMENTED | unzip APK, dump manifest/strings/certs, optional apktool/jadx shell-out | triage |
+| 10 | `stego` | **P2** | IMPLEMENTED | LSB extract, appended-data / polyglot finder, bit-plane + palette dumps | forensics |
 
 ---
 
@@ -278,6 +284,10 @@ confirms graceful behavior without `PIL`. Offline, no external files.
 
 ## Menu / README scaling (for a growing module count)
 
+> **Status:** README table and `--selftest` gate are in place. `CATEGORY` menu
+> grouping and `recon.py --list` were **not implemented** (deferred, optional);
+> the flat menu plus `recon.py -h` (lists module names) covers the current 16.
+
 - **Menu grouping.** As the list grows past ~8, `recon.py`'s flat numbered menu
   gets unwieldy. Plan a lightweight `CATEGORY` optional module attribute
   (`"recon" | "crypto" | "exploit" | "forensics" | "web"`); the menu groups by
@@ -294,7 +304,7 @@ confirms graceful behavior without `PIL`. Offline, no external files.
 - **Selftest as CI gate.** `recon.py --selftest` returning `0` is the merge
   gate for every module PR; the growing count is self-documenting through it.
 
-## Suggested implementation order (for the sonnet issues)
+## Suggested implementation order (for the sonnet issues) — DONE
 
 1. `batch`, `hashid`, `shellcode` (the P0 tier — immediate scoring leverage).
 2. Menu `CATEGORY` scaffold (tiny, unblocks grouping).

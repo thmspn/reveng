@@ -311,9 +311,9 @@ def run(args: list[str]) -> int:
         ns = parser.parse_args(args)
     except SystemExit as exc:
         return exc.code if isinstance(exc.code, int) else 0
-    if not ns.cmd:
+    if not ns.cmd:  # bare invocation: usage + 0 (PLAN.md quality bar)
         parser.print_help()
-        return 2
+        return 0
     if ns.cmd == "selftest":
         return 0 if selftest() else 1
     try:
@@ -542,6 +542,12 @@ def selftest() -> bool:
     except LibcError:
         pass
 
+    # CLI exit-code contract: bare/-h -> 0, unknown subcommand -> 2 (help text silenced)
+    import contextlib
+    import io as _io
+    with contextlib.redirect_stdout(_io.StringIO()), contextlib.redirect_stderr(_io.StringIO()):
+        codes = (run([]), run(["-h"]), run(["--bogus-flag"]))
+    check("cli: bare/-h -> 0, unknown -> 2", codes == (0, 0, 2))
     return ok
 
 
