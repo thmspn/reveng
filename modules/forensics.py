@@ -93,6 +93,10 @@ def parse_frame(link: int, fr: bytes) -> dict | None:
             et, p = struct.unpack(">H", fr[14:16])[0], 16
         elif link == 0:
             et, p = (0x0800 if fr[0] == 2 else 0x86DD), 4
+        elif link == 228:  # LINKTYPE_IPV4: raw IPv4, no L2 header
+            et, p = 0x0800, 0
+        elif link == 229:  # LINKTYPE_IPV6
+            et, p = 0x86DD, 0
         elif link in (101, 12, 14):
             et, p = (0x0800 if fr[0] >> 4 == 4 else 0x86DD), 0
         else:
