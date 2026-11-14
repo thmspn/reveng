@@ -252,6 +252,19 @@ confirms graceful behavior without `PIL`. Offline, no external files.
 
 ---
 
+## Flagship: `revauto` — SPECCED (issue #44)
+
+| # | module | prio | status | one-liner | depends on |
+|---|--------|------|--------|-----------|-----------|
+| 11 | `revauto` | **P0 / flagship** | SPECCED | automated RE analyst: unwrap obfuscated py/js/sh layers (pure transforms only), label what every part does, IOCs + tells; ELF/PE digest via r2 / ghidra / stdlib fallback | triage, disasm, binextras, decode, pwnhelp, batch |
+
+The full spec, data model, selftest plan and acceptance criteria live in
+[`PLAN-revauto.md`](PLAN-revauto.md) (it is too large for this file). It is
+held to every rule in this document; on conflict, the hard constraints and
+quality bar here win. When implemented, the global selftest becomes `17/17`.
+
+---
+
 ## Quality bar (every module must meet)
 
 - **CLI consistency.** Subcommand-style modules (`disasm`, `crypto`) and
