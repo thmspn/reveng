@@ -492,6 +492,12 @@ class _Extractor:
             f = m.group().decode("latin-1")
             self.flags.setdefault(f, path)
             node["note"] = (node["note"] + " " if node["note"] else "") + f"FLAG {f}"
+        if hunt_flags and b"\x00" in blob[:8192]:  # UTF-16 flags: even/odd byte lanes catch ASCII-range text
+            for lane in (blob[0::2], blob[1::2]):
+                for m in FLAG_RE.finditer(lane):
+                    f = m.group().decode("latin-1")
+                    self.flags.setdefault(f, path)
+                    node["note"] = (node["note"] + " " if node["note"] else "") + f"FLAG {f} (utf16)"
         self.scan(blob, node, depth + 1, os.path.basename(path))
 
     def scan(self, data: bytes, node: dict, depth: int, stem: str) -> None:
