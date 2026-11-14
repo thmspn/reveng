@@ -307,7 +307,7 @@ def analyze(data: bytes, min_len: int = 4, max_strings: int = 200, show_strings:
 
 def run(args: list[str]) -> int:
     """CLI entry point (registry contract); returns a process exit code."""
-    if args[:1] == ["selftest"]:
+    if args[:1] in (["selftest"], ["--selftest"]):
         return 0 if selftest() else 1
     p = argparse.ArgumentParser(prog="recon.py triage", description=DESCRIPTION)
     p.add_argument("path", help="file to analyze")
@@ -434,3 +434,7 @@ def _raises(fn) -> bool:
     except ValueError:
         return True
     return False
+
+
+if __name__ == "__main__":
+    sys.exit(run(sys.argv[1:]))

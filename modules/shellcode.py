@@ -22,7 +22,10 @@ import re
 import string
 import sys
 
-from . import disasm
+if __package__:  # imported via the registry (modules.shellcode)
+    from . import disasm
+else:  # run standalone: python3 modules/shellcode.py -- modules/ is sys.path[0]
+    import disasm  # type: ignore[no-redef]
 
 NAME = "shellcode"
 DESCRIPTION = "Badchar checker, XOR/rolling encoder + decoder stub, hex/raw/\\x/C/py format converters, known static stubs"

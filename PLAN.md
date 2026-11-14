@@ -42,7 +42,10 @@ just drop the file in `modules/`.
 | `disasm` | merged | x86/x64 ELF `.text` disasm (capstone-opt), entry, call/string xrefs, syscall + opcode tables, objdump/r2 shell-out |
 | `crypto` | merged | freq analysis, repeating-XOR / Vigenere break, ECB detect, substitution helper |
 | `forensics` | merged | pcap parse / TCP streams / HTTP objects / keyword hunt, JPEG-EXIF / PNG / PDF metadata, magic-header repair |
-| `binextras` | in flight | cyclic patterns, ROP gadget finder, binwalk-style carving |
+| `binextras` | merged | cyclic patterns, ROP gadget finder, binwalk-style carving |
+| `batch` | merged (P0) | directory auto-triage; routes to triage/forensics/disasm/decode via the registry |
+| `hashid` | merged (P0) | credential-hash identification + offline dictionary crack |
+| `shellcode` | merged (P0) | badchars, XOR encoders, format converters, reference stubs |
 
 **Boundary rules so the expansion does not collide:**
 - Shellcode work goes in `shellcode` (new), not `disasm`. `disasm` reads;
@@ -250,7 +253,10 @@ confirms graceful behavior without `PIL`. Offline, no external files.
   style that fits and stay internally consistent**. Required across all:
   bare/`-h`/`--help` prints usage and returns `0`; unknown subcommand prints
   usage and returns `2`; a `selftest` path reachable both as `recon.py <m>
-  selftest` *and* via the global `recon.py --selftest`.
+  selftest` *and* via the global `recon.py --selftest`. `<m> --selftest` is
+  accepted as an alias, and every module also runs standalone
+  (`python3 modules/<m>.py ...`, with an `if __name__ == "__main__"` block and
+  imports that work outside the package).
 - **Exit codes.** `0` success, `1` runtime/analysis failure (bad input, missing
   optional dependency that was required for the asked task), `2` usage error.
 - **Error handling.** No stack traces to the user. Wrap file I/O and parsing in
@@ -296,4 +302,4 @@ confirms graceful behavior without `PIL`. Offline, no external files.
 4. `pwnhelp`, `apk`, `stego` (P2, as time allows before Nov 21).
 
 One module per PR, each green under `recon.py --selftest`, each adding its
-README row. Design around the six existing modules; import, don't duplicate.
+README row. Design around the existing modules; import, don't duplicate.

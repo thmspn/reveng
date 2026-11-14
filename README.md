@@ -1,12 +1,13 @@
 # RE toolkit (offline)
 
 Helper scripts for CTF reversing (ELF crackmes, packed/obfuscated binaries).
-**100% offline**: no network calls, no telemetry, no runtime installs. Python 3 standard library only.
+**100% offline**: no network calls, no telemetry, no runtime installs. Python 3 standard library first.
+Design, module boundaries and the quality bar every module meets are in [`PLAN.md`](PLAN.md).
 
 ## Requirements
 Python 3.9+ (Kali default is fine). Standard library first; optional libs (capstone, pyelftools, pwntools)
-are only used via guarded `try/except ImportError` imports with a stdlib fallback (today: `disasm` uses
-capstone when present, hex view otherwise). External tools (objdump, r2, ropper, ROPgadget) are opt-in
+are only used via guarded `try/except ImportError` imports with a stdlib fallback (today: `disasm`/`shellcode` use
+capstone when present, hex view otherwise; `hashid` verifies bcrypt/sha*crypt only if `bcrypt`/`passlib` is present). External tools (objdump, r2, ropper, ROPgadget) are opt-in
 "external-tool mode", gated by `shutil.which`.
 
 ## Run
@@ -15,9 +16,13 @@ python3 recon.py                    # interactive numbered menu
 python3 recon.py triage ./binary    # run one module directly
 python3 recon.py triage ./binary -n 8 --no-strings
 python3 recon.py --selftest         # run all module self-tests
-python3 recon.py <module> selftest  # run one module's self-test
+python3 recon.py <module> selftest  # run one module's self-test (`--selftest` also accepted)
 python3 recon.py <module> -h        # module usage (exit 0)
+python3 modules/<module>.py [args]  # every module also runs standalone, same CLI
 ```
+Exit codes everywhere: `0` success, `1` runtime/analysis failure (bad input, file missing, not found),
+`2` usage error. Self-test output: the global run prints one `[PASS]`/`[FAIL]` line per module and
+`N/N modules passed`, exiting non-zero on any failure.
 
 ## Modules
 | name | description |

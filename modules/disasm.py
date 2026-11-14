@@ -258,7 +258,7 @@ def run(args: list[str]) -> int:
         return 0
     cmd, rest = args[0], args[1:]
     try:
-        if cmd == "selftest":
+        if cmd in ("selftest", "--selftest"):
             return 0 if selftest() else 1
         if cmd == "opcodes":
             for b, d in OPCODES:

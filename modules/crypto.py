@@ -352,7 +352,7 @@ def run(args: list[str]) -> int:
         print(_USAGE)
         return 0
     cmd, rest = args[0], args[1:]
-    if cmd == "selftest":
+    if cmd in ("selftest", "--selftest"):
         return 0 if selftest() else 1
     if not rest:
         print(_USAGE)

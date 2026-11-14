@@ -375,7 +375,7 @@ def _parse_key(k: str) -> bytes:
 
 def run(args: list[str]) -> int:
     """CLI entry point (registry contract); returns a process exit code."""
-    if args[:1] == ["selftest"]:
+    if args[:1] in (["selftest"], ["--selftest"]):
         return 0 if selftest() else 1
     p = argparse.ArgumentParser(prog="recon.py decode", description=DESCRIPTION,
                                 epilog="With no mode flag: hints + auto multi-round decode (+ rot/xor fallbacks).")

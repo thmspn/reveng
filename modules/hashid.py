@@ -391,7 +391,9 @@ def crack_any(hashstr: str, wordlist_path: str, rules: bool = False, max_lines: 
 # --------------------------------------------------------------------------- CLI
 
 def run(args: list[str]) -> int:
-    """CLI entry point: ``id <hash>`` / ``crack <hash> [--wordlist P] [--rules]``."""
+    """CLI entry point: ``id <hash>`` / ``crack <hash> [--wordlist P] [--rules]`` / ``selftest``."""
+    if args[:1] in (["selftest"], ["--selftest"]):
+        return 0 if selftest() else 1
     p = argparse.ArgumentParser(prog="recon.py hashid", description=DESCRIPTION)
     sub = p.add_subparsers(dest="cmd")
 

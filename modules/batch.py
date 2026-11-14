@@ -14,6 +14,7 @@ Fully offline; files are treated as untrusted and read with a size cap.
 """
 from __future__ import annotations
 
+import contextlib
 import gzip
 import io
 import json
@@ -224,7 +225,7 @@ def run(args: list[str]) -> int:
     if not args or args[0] in ("-h", "--help"):
         print(USAGE)
         return 0
-    if args[0] == "selftest":
+    if args[0] in ("selftest", "--selftest"):
         return 0 if selftest() else 1
     opts = {a for a in args if a.startswith("-")}
     unknown = opts - {"--quick", "--json", "-r"}
@@ -296,6 +297,15 @@ def selftest() -> bool:
             check(False, "--json not parseable")
         check("note.txt" in format_table(recs), "table renders")
         os.chmod(locked, 0o600)
-    check(run(["/nonexistent-batch-dir"]) == 1, "missing path returns 1")
-    check(run(["--bogus", "x"]) == 2, "bad flag returns 2")
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        missing_rc = run(["/nonexistent-batch-dir"])
+        badflag_rc = run(["--bogus", "x"])
+    check(missing_rc == 1, "missing path returns 1")
+    check(badflag_rc == 2, "bad flag returns 2")
     return ok
+
+
+if __name__ == "__main__":
+    # standalone: put toolkit/ on sys.path so the registry (``from modules import discover``) resolves
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    sys.exit(run(sys.argv[1:]))
