@@ -467,11 +467,36 @@ def run(args: list[str]) -> int:
     return 0
 
 
+def whitespace_binary(text: str) -> list[bytes]:
+    """Decode text made of exactly two whitespace characters as 8-bit binary
+    (space/tab, space/em-space stego - battery ic-3). Tries both bit assignments."""
+    stripped = text.strip("\r\n")
+    uniq = sorted(set(stripped))
+    if len(uniq) != 2 or not all(ch.isspace() for ch in uniq) or len(stripped) < 8:
+        return []
+    out = []
+    for bit in (0, 1):
+        s = stripped.replace(uniq[bit], "0").replace(uniq[1 - bit], "1")
+        s += "0" * ((-len(s)) % 8)
+        try:
+            out.append(int(s, 2).to_bytes(len(s) // 8, "big"))
+        except ValueError:
+            pass
+    return out
+
+
 def _default(raw: bytes, text: str, ns) -> None:
     """'Just works' mode for a pasted blob."""
     print("== hints (heuristic guesses, not certainties) ==")
     for h in hints(text):
         print(f"  [hint] {h}")
+    ws = whitespace_binary(text)
+    if ws:
+        print("\n== whitespace binary (two distinct whitespace chars as bits) ==")
+        for cand in ws:
+            print(f"  {_show(cand)}")
+        if any(plaintext_like(cand) for cand in ws):
+            return
     print("\n== auto-decode ==")
     final, chain = auto_decode(text, ns.rounds)
     if chain:
