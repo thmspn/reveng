@@ -223,6 +223,22 @@ def stream_strings(pkts: list[dict], minlen: int = 6) -> list[dict]:
                             **carve_strings(s[dirn], minlen)})
     for (src, sp, dst, dp), buf in udp_streams(pkts).items():
         out.append({"label": f"UDP {src}:{sp} -> {dst}:{dp}", "size": len(buf), **carve_strings(buf, minlen)})
+    # Arrival-order rescan: seq-based reassembly drops overlapping/retransmitted bytes, which is
+    # exactly where pcaps hide flags (battery ic-2). Rescan raw capture-order payloads and report
+    # only flags the seq-based pass missed.
+    arrival: dict = {}
+    for p in pkts:
+        if p["proto"] == "TCP" and p.get("data"):
+            arrival.setdefault((p["src"], p["sport"], p["dst"], p["dport"]), bytearray())
+            arrival[(p["src"], p["sport"], p["dst"], p["dport"])] += p["data"]
+    known = {f for e in out for f in e["flags"]}
+    for (src, sp, dst, dp), buf in arrival.items():
+        res = carve_strings(bytes(buf), minlen)
+        extra = [f for f in res["flags"] if f not in known]
+        if extra:
+            out.append({"label": f"TCP {src}:{sp} -> {dst}:{dp} (arrival-order rescan)", "size": len(buf),
+                        "flags": extra, "runs": res["runs"]})
+            known.update(extra)
     return out
 
 
