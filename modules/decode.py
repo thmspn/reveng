@@ -490,11 +490,14 @@ def _default(raw: bytes, text: str, ns) -> None:
     print("== hints (heuristic guesses, not certainties) ==")
     for h in hints(text):
         print(f"  [hint] {h}")
-    ws = whitespace_binary(text)
+    # UTF-8 first: multi-byte spaces (em-space stego) die under the latin-1 default decode.
+    ws = whitespace_binary(raw.decode("utf-8", "ignore")) or whitespace_binary(text)
     if ws:
         print("\n== whitespace binary (two distinct whitespace chars as bits) ==")
         for cand in ws:
             print(f"  {_show(cand)}")
+            for m in re.findall(rb"[A-Za-z0-9_\-]{2,24}\{[\x21-\x7a\x7c\x7e]{1,200}\}", cand):
+                print(f"  [FLAG?] {m.decode('ascii', 'replace')}")
         if any(plaintext_like(cand) for cand in ws):
             return
     print("\n== auto-decode ==")
