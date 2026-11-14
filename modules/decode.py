@@ -233,9 +233,20 @@ def rot(text: str, shift: int) -> str:
     return "".join(out)
 
 
+_FLAG_RE = re.compile(r"[A-Za-z][A-Za-z0-9]{2,9}\{[ -~]{4,80}\}")
+
+
 def rot_bruteforce(text: str) -> list[tuple[float, int, str]]:
-    """All 25 shifts as (score, shift, plaintext), best first."""
-    res = [(english_score(rot(text, k).encode("latin-1", "replace")), k, rot(text, k)) for k in range(1, 26)]
+    """All 25 shifts as (score, shift, plaintext), best first. Flag-shaped
+    plaintext gets a +1 bonus so word{...} answers outrank generic-English
+    garbage rotations (battery gap: rot13 flags lost the top-3)."""
+    res = []
+    for k in range(1, 26):
+        pt = rot(text, k)
+        s = english_score(pt.encode("latin-1", "replace"))
+        if _FLAG_RE.search(pt):
+            s += 1.0
+        res.append((s, k, pt))
     return sorted(res, reverse=True)
 
 
