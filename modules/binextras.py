@@ -319,7 +319,7 @@ def carve(data: bytes, offset: int, length: int = None) -> bytes:
 MAX_DEPTH = 10                 # default recursion cap
 MAX_FILE_BYTES = 256 << 20     # per extracted file (decompression-bomb guard)
 MAX_TOTAL_BYTES = 1 << 30      # per run
-MAX_FILES = 2000               # per run
+MAX_FILES = 20000              # per run (battery ic-38: flag sat past the 2000th zip member)
 FLAG_RE = re.compile(rb"[A-Za-z0-9_\-]{2,24}\{[\x21-\x7a\x7c\x7e]{1,200}\}")
 _EOCD = b"PK\x05\x06"
 
