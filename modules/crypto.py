@@ -1,18 +1,24 @@
 """crypto: classical/CTF cryptanalysis helpers (offline, stdlib only).
 
 Frequency analysis, repeating-key XOR break, Vigenere auto-break,
-AES-ECB detection, substitution-cipher helper.
+AES-ECB detection, substitution-cipher helper, RSA lane (known p/q, small-n factoring,
+small-e root, Wiener, dp/dq leak).
 """
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
 import math
+import os
 import re
 import string
 import sys
+import tempfile
 from collections import Counter
 
 NAME = "crypto"
-DESCRIPTION = "Cryptanalysis: freq analysis, repeating-XOR/Vigenere break, ECB detect, substitution helper"
+DESCRIPTION = "Cryptanalysis: freq analysis, repeating-XOR/Vigenere break, ECB detect, substitution helper, RSA attacks"
 
 ALPHA = string.ascii_uppercase
 # English letter frequencies (percent), A..Z
@@ -270,6 +276,342 @@ def subst_apply(ct: str, mapping: dict[str, str], unknown: str = "_") -> str:
                    for c in ct)
 
 
+
+# ---------------------------------------------------------------- RSA
+RSA_FLAG_RE = re.compile(rb"[A-Za-z0-9_\-]{2,24}\{[\x21-\x7a\x7c\x7e]{1,200}\}")
+_SMALL_PRIMES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
+TRIAL_LIMIT = 1 << 20
+FERMAT_ITERS = 1 << 20
+SMALL_E_MAX = 1023  # exact-root attack only makes sense for small public exponents
+_RSA_NAMES = {"n": "n", "e": "e", "c": "c", "ct": "c", "ciphertext": "c", "cipher": "c",
+              "p": "p", "q": "q", "dp": "dp", "dq": "dq", "d": "d"}
+
+
+def parse_int(text: str) -> int:
+    """Parse a decimal or 0x-hex integer (underscores and a trailing python-2 ``L`` tolerated)."""
+    t = text.strip().replace("_", "").rstrip("lL")
+    return int(t, 16) if t.lower().startswith(("0x", "-0x")) else int(t, 10)
+
+
+def parse_rsa_text(text: str) -> dict[str, int]:
+    """Pull RSA parameters out of text / python source. Matches ``name = value`` or ``name: value`` for
+    n, e, c (also ct/cipher/ciphertext), p, q, dp, dq, d (case-insensitive); value is decimal or 0x hex.
+    The first occurrence of each parameter wins. Non-numeric right-hand sides (``n = p * q``) are ignored."""
+    out: dict[str, int] = {}
+    pat = re.compile(r"(?<![\w.])(ciphertext|cipher|ct|dp|dq|n|e|c|p|q|d)\s*(?<![=!<>])[=:]\s*(?!=)['\"]?"
+                     r"(0[xX][0-9a-fA-F_]+|\d[\d_]*)[lL]?(?![\w.])", re.I)
+    for m in pat.finditer(text):
+        key = _RSA_NAMES[m.group(1).lower()]
+        if key not in out:
+            out[key] = parse_int(m.group(2))
+    return out
+
+
+def is_probable_prime(n: int) -> bool:
+    """Miller-Rabin with the first 12 primes as bases (deterministic below ~3.3e24, overwhelmingly reliable above)."""
+    if n < 2:
+        return False
+    for q in _SMALL_PRIMES:
+        if n % q == 0:
+            return n == q
+    d, r = n - 1, 0
+    while d % 2 == 0:
+        d //= 2
+        r += 1
+    for a in _SMALL_PRIMES:
+        x = pow(a, d, n)
+        if x in (1, n - 1):
+            continue
+        for _ in range(r - 1):
+            x = x * x % n
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+
+def next_prime(n: int) -> int:
+    """Smallest prime strictly greater than ``n``."""
+    n += 1
+    if n <= 2:
+        return 2
+    n |= 1
+    while not is_probable_prime(n):
+        n += 2
+    return n
+
+
+def iroot(x: int, k: int) -> int:
+    """floor(x ** (1/k)) by Newton iteration on integers (x >= 0, k >= 1)."""
+    if x < 2 or k == 1:
+        return x
+    r = 1 << ((x.bit_length() + k - 1) // k)  # >= true root
+    while True:
+        nr = ((k - 1) * r + x // r ** (k - 1)) // k
+        if nr >= r:
+            return r
+        r = nr
+
+
+def int_to_bytes(m: int) -> bytes:
+    """Big-endian bytes of a non-negative int (b'\\x00' for 0)."""
+    return m.to_bytes(max(1, (m.bit_length() + 7) // 8), "big")
+
+
+def fermat_factor(n: int, iters: int = FERMAT_ITERS) -> tuple[int, int] | None:
+    """Fermat's method for n = p*q with p, q close together; gives up after ``iters`` steps."""
+    if n < 4 or n % 2 == 0:
+        return None
+    a = math.isqrt(n)
+    if a * a < n:
+        a += 1
+    for _ in range(iters):
+        b2 = a * a - n
+        b = math.isqrt(b2)
+        if b * b == b2:
+            p, q = a - b, a + b
+            return (p, q) if 1 < p < q else None
+        a += 1
+    return None
+
+
+def factor_small(n: int, trial: int = TRIAL_LIMIT, fermat_iters: int = FERMAT_ITERS) -> tuple[dict[int, int], int]:
+    """Try to fully factor n: trial division to ``trial``, Miller-Rabin on the cofactor, then Fermat on any
+    composite remainder. Returns ({prime: exponent}, unfactored_cofactor); cofactor is 1 on full success."""
+    fac: dict[int, int] = {}
+    r = n
+    d = 2
+    while d <= trial and d * d <= r:
+        while r % d == 0:
+            fac[d] = fac.get(d, 0) + 1
+            r //= d
+        d += 1 if d == 2 else 2
+    stack = [r] if r > 1 else []
+    leftover = 1
+    while stack:
+        x = stack.pop()
+        if x < 2:
+            continue
+        if is_probable_prime(x):
+            fac[x] = fac.get(x, 0) + 1
+            continue
+        root = math.isqrt(x)
+        if root * root == x:
+            stack += [root, root]
+            continue
+        f = fermat_factor(x, fermat_iters)
+        if f:
+            stack += list(f)
+        else:
+            leftover *= x
+    return fac, leftover
+
+
+def _phi_from_factors(fac: dict[int, int]) -> int:
+    phi = 1
+    for p, k in fac.items():
+        phi *= (p - 1) * p ** (k - 1)
+    return phi
+
+
+def wiener(e: int, n: int) -> tuple[int, int, int] | None:
+    """Wiener's attack (small private exponent). Returns (d, p, q) or None."""
+    a, b = e, n  # continued fraction expansion of e/n
+    h0, h1, k0, k1 = 0, 1, 1, 0
+    while b:
+        qt = a // b
+        a, b = b, a - qt * b
+        h0, h1 = h1, qt * h1 + h0
+        k0, k1 = k1, qt * k1 + k0
+        k, d = h1, k1  # convergent k/d
+        if k == 0 or (e * d - 1) % k:
+            continue
+        phi = (e * d - 1) // k
+        s = n - phi + 1  # p + q
+        disc = s * s - 4 * n
+        if disc >= 0:
+            r = math.isqrt(disc)
+            if r * r == disc and (s + r) % 2 == 0:
+                p, q = (s - r) // 2, (s + r) // 2
+                if p > 1 and p * q == n:
+                    return d, p, q
+    return None
+
+
+def _decrypt(c: int | None, d: int, n: int) -> int | None:
+    return pow(c, d, n) if c is not None else None
+
+
+def rsa_attack(n: int | None = None, e: int | None = None, c: int | None = None, p: int | None = None,
+               q: int | None = None, dp: int | None = None, dq: int | None = None, d: int | None = None,
+               trial: int = TRIAL_LIMIT, fermat_iters: int = FERMAT_ITERS) -> dict:
+    """Run the RSA attacks in order, stopping at the first that recovers the key/plaintext:
+    (a) p/q given, (a2) dp/dq leak, (b) small-n factoring (trial division then Fermat),
+    (c) small-e exact e-th root, (d) Wiener. Returns {'ok', 'm', 'd', 'factors', 'method', 'tried'} where
+    ``tried`` is a list of (attack, outcome) strings."""
+    res: dict = {"ok": False, "m": None, "d": d, "factors": None, "method": None, "tried": []}
+    tried = res["tried"]
+
+    def done(method: str, dd: int | None, factors=None) -> dict:
+        res.update(ok=True, method=method, d=dd, factors=factors)
+        if dd is not None and n is not None:
+            res["m"] = _decrypt(c, dd, n)
+        return res
+
+    if n is None and p and q:
+        n = p * q
+    if n is None:
+        tried.append(("input", "no modulus n (and no p+q to derive it)"))
+        return res
+    if p and not q and n % p == 0:
+        q = n // p
+    if q and not p and n % q == 0:
+        p = n // q
+    if d is not None:
+        tried.append(("(0) d given", "using supplied d"))
+        return done("private exponent supplied", d)
+    if e is None:
+        tried.append(("input", "no public exponent e"))
+        return res
+
+    # (a) p and q known
+    if p and q:
+        if p * q != n:
+            tried.append(("(a) p,q given", "p*q != n; supplied values inconsistent"))
+        else:
+            try:
+                dd = pow(e, -1, (p - 1) * (q - 1))
+                tried.append(("(a) p,q given", "derived d"))
+                return done("p and q given", dd, {p: 1, q: 1})
+            except ValueError:
+                tried.append(("(a) p,q given", "e not invertible mod phi (gcd(e,phi) != 1)"))
+    else:
+        tried.append(("(a) p,q given", "skipped (p and q not both known)"))
+
+    # (a2) dp / dq leak: gcd(2^(e*dp) - 2, n) = p
+    leak = None
+    for name, v in (("dp", dp), ("dq", dq)):
+        if v:
+            g = math.gcd(pow(2, e * v, n) - 2, n)
+            if 1 < g < n:
+                leak = (name, g)
+                break
+    if leak:
+        pp = leak[1]
+        qq = n // pp
+        try:
+            dd = pow(e, -1, (pp - 1) * (qq - 1))
+            tried.append(("(a2) dp/dq leak", f"{leak[0]} leaked a factor of n"))
+            return done(f"{leak[0]} leak", dd, {pp: 1, qq: 1})
+        except ValueError:
+            tried.append(("(a2) dp/dq leak", "factor found but e not invertible mod phi"))
+    else:
+        tried.append(("(a2) dp/dq leak", "skipped (no dp/dq)" if not (dp or dq) else "no factor from dp/dq"))
+
+    # (b) factor n
+    fac, rest = factor_small(n, trial, fermat_iters)
+    if rest == 1 and len(fac) + sum(fac.values()) > 1:
+        phi = _phi_from_factors(fac)
+        try:
+            dd = pow(e, -1, phi)
+            tried.append(("(b) factor small n", "factored: " + " * ".join(
+                str(f) if k == 1 else f"{f}^{k}" for f, k in sorted(fac.items()))))
+            return done("factoring", dd, fac)
+        except ValueError:
+            tried.append(("(b) factor small n", "factored but gcd(e, phi) != 1 (e.g. e=2 / Rabin); decrypt manually"))
+    else:
+        known = f" (partial: found {sorted(fac)})" if fac else ""
+        tried.append(("(b) factor small n", f"no factorization: trial division to 2^{trial.bit_length() - 1}, "
+                      f"Fermat {fermat_iters} iters{known}"))
+
+    # (c) small e: c is a perfect e-th power
+    if c is not None and e > SMALL_E_MAX:
+        tried.append(("(c) small e root", f"skipped (e > {SMALL_E_MAX}; not a small-exponent key)"))
+    elif c is not None:
+        r = iroot(c, e)
+        if r ** e == c:
+            tried.append(("(c) small e root", f"c is a perfect {e}-th power (m^e < n)"))
+            res.update(ok=True, method=f"small-e exact {e}-th root", m=r)
+            return res
+        tried.append(("(c) small e root", f"c is not a perfect {e}-th power (m^e >= n, padding or large e)"))
+    else:
+        tried.append(("(c) small e root", "skipped (no ciphertext)"))
+
+    # (d) Wiener
+    w = wiener(e, n)
+    if w:
+        tried.append(("(d) Wiener", "small private exponent recovered"))
+        return done("Wiener (small d)", w[0], {w[1]: 1, w[2]: 1})
+    tried.append(("(d) Wiener", "no convergent yields a valid d"))
+    return res
+
+
+def format_plaintext(m: int) -> tuple[str, str, list[str]]:
+    """Return (hex, printable-ascii, flag-shaped strings) for the recovered plaintext integer."""
+    b = int_to_bytes(m)
+    asc = "".join(chr(x) if 32 <= x < 127 else "." for x in b)
+    return b.hex(), asc, [f.decode("latin-1") for f in RSA_FLAG_RE.findall(b)]
+
+
+_RSA_MANUAL = """  what to try manually:
+    - n looks big: factor offline with yafu / msieve / cado-nfs / sage, or look it up in a factor database from a
+      networked machine (this toolkit never touches the network)
+    - several ciphertexts of one message under e=3 with different n -> Hastad broadcast (CRT + cube root)
+    - same n with two coprime e values -> common-modulus attack; shared prime across several n -> gcd(n1, n2)
+    - m^e slightly > n: try iroot(c + k*n, e) for small k;  e=2 -> Rabin;  check challenge source for hints (p-q small,
+      p or q leaked partially, d bits leaked, weak RNG/prime generation)"""
+
+
+def _rsa_cli(args: list[str]) -> int:
+    """``crypto rsa`` entry: --n/--e/--c (dec or 0x), or -f FILE auto-parse (n,e,c,p,q,dp,dq,d)."""
+    ap = argparse.ArgumentParser(prog="recon.py crypto rsa", description="RSA attacks: known p/q, small-n factoring, "
+                                 "small-e root, Wiener, dp/dq leak")
+    for k in ("n", "e", "c", "p", "q", "dp", "dq", "d"):
+        ap.add_argument(f"--{k}", type=parse_int, help=f"{k} (decimal or 0x hex)")
+    ap.add_argument("-f", "--file", help="text/python source to auto-parse parameters from")
+    try:
+        a = ap.parse_args(args)
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else 2
+    params: dict[str, int] = {}
+    if a.file:
+        try:
+            with open(a.file, "r", encoding="utf-8", errors="replace") as fh:
+                params = parse_rsa_text(fh.read())
+        except OSError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print("parsed from file: " + (", ".join(f"{k}={str(v)[:24]}{'...' if len(str(v)) > 24 else ''}"
+                                                 for k, v in params.items()) or "nothing"))
+    for k in ("n", "e", "c", "p", "q", "dp", "dq", "d"):
+        if getattr(a, k) is not None:
+            params[k] = getattr(a, k)
+    if not params:
+        ap.print_usage()
+        return 2
+    res = rsa_attack(**params)
+    for name, outcome in res["tried"]:
+        print(f"  {name}: {outcome}")
+    if not res["ok"]:
+        print("RSA: no attack succeeded.")
+        print(_RSA_MANUAL)
+        return 1
+    print(f"RSA: recovered via {res['method']}")
+    if res["factors"]:
+        print("  factors: " + " * ".join(str(f) if k == 1 else f"{f}^{k}" for f, k in sorted(res["factors"].items())))
+    if res["d"] is not None:
+        print(f"  d = {res['d']}")
+    if res["m"] is None:
+        print("  (no ciphertext supplied; key material only)")
+        return 0
+    hx, asc, flags = format_plaintext(res["m"])
+    print(f"  m (hex)  : {hx}\n  m (ascii): {asc}")
+    for f in flags:
+        print(f"  >>> FLAG: {f}")
+    return 0
+
+
 # ---------------------------------------------------------------- selftest
 _PLAIN = ("It was the best of times, it was the worst of times, it was the age of wisdom, "
           "it was the age of foolishness, it was the epoch of belief, it was the epoch of "
@@ -332,6 +674,72 @@ def selftest() -> bool:
     g = subst_apply(enc, subst_initial_map(enc))
     check("subst initial guess runs", len(g) == len(enc))
     check("parse_mapping 26-char", parse_mapping("." * 25 + "A") == {"Z": "A"})
+
+    # RSA lane (synthetic keys built from Mersenne primes / next_prime; no fixtures on disk)
+    msg = b"flag{rsa_lane_ok}"
+    m_int = int.from_bytes(msg, "big")
+    p1, q1 = (1 << 127) - 1, (1 << 521) - 1
+
+    def enc(mm: int, ee: int, nn: int) -> int:
+        return pow(mm, ee, nn)
+
+    n1 = p1 * q1
+    r = rsa_attack(n=n1, e=65537, c=enc(m_int, 65537, n1), p=p1, q=q1)
+    check("rsa (a): p,q given", r["ok"] and int_to_bytes(r["m"]) == msg and r["method"] == "p and q given")
+    r = rsa_attack(e=65537, c=enc(m_int, 65537, n1), p=p1, q=q1)
+    check("rsa (a): n derived from p*q", r["ok"] and int_to_bytes(r["m"]) == msg)
+    r = rsa_attack(n=n1, e=65537, c=enc(m_int, 65537, n1), p=p1)
+    check("rsa (a): only p given -> q = n/p", r["ok"] and int_to_bytes(r["m"]) == msg)
+
+    sp = 1000003  # small prime below 2^20 -> trial division
+    n2 = sp * ((1 << 127) - 1)
+    r = rsa_attack(n=n2, e=65537, c=enc(m_int % n2, 65537, n2), fermat_iters=50)
+    check("rsa (b): trial division on small factor", r["ok"] and r["method"] == "factoring" and r["m"] == m_int % n2)
+    pn = next_prime(1 << 200)
+    qn = next_prime(pn + 100000)
+    n3 = pn * qn
+    r = rsa_attack(n=n3, e=65537, c=enc(m_int, 65537, n3))
+    check("rsa (b): Fermat on close primes", r["ok"] and r["method"] == "factoring" and int_to_bytes(r["m"]) == msg)
+    r = rsa_attack(n=pn, e=65537, c=enc(m_int, 65537, pn))
+    check("rsa (b): n itself prime -> phi = n-1", r["ok"] and int_to_bytes(r["m"]) == msg)
+    r = rsa_attack(n=n1, e=3, c=enc(m_int, 3, n1), fermat_iters=100)
+    check("rsa (c): small e exact cube root", r["ok"] and "small-e" in r["method"] and int_to_bytes(r["m"]) == msg)
+    check("rsa: iroot exactness", iroot(10 ** 60, 3) == 10 ** 20 and iroot(10 ** 60 - 1, 3) == 10 ** 20 - 1)
+
+    pw = next_prime((1 << 128) + (1 << 120))
+    qw = next_prime((1 << 128) + (1 << 121))
+    nw, phiw = pw * qw, (pw - 1) * (qw - 1)
+    dw = next_prime(1 << 40)
+    while math.gcd(dw, phiw) != 1:
+        dw = next_prime(dw)
+    ew = pow(dw, -1, phiw)
+    r = rsa_attack(n=nw, e=ew, c=enc(m_int, ew, nw), fermat_iters=100)
+    check("rsa (d): Wiener small d", r["ok"] and r["d"] == dw and int_to_bytes(r["m"]) == msg, r["method"] or "")
+    r = rsa_attack(n=nw, e=65537, c=enc(m_int, 65537, nw), dp=pow(65537, -1, pw - 1), fermat_iters=100)
+    check("rsa (a2): dp leak", r["ok"] and r["method"] == "dp leak" and int_to_bytes(r["m"]) == msg)
+    r = rsa_attack(n=nw, e=65537, c=enc(m_int, 65537, nw), fermat_iters=100)
+    check("rsa: hard instance fails and lists all attacks tried", (not r["ok"]) and len(r["tried"]) >= 5)
+
+    txt = f"# level1.py\nn = {n3}\ne = 0x10001\nc: {enc(m_int, 65537, n3)}\nx = p * q\nok == 5\n"
+    pt = parse_rsa_text(txt)
+    check("rsa parse: dec/hex, ':' and '=', ignores p*q and ==",
+          pt == {"n": n3, "e": 65537, "c": enc(m_int, 65537, n3)})
+    pt2 = parse_rsa_text("N = 0xff\nE = 3\nciphertext = 0x10\np = 3\nq = 5\ndp = 7\ndq=9\n")
+    check("rsa parse: uppercase/ciphertext/p/q/dp/dq", pt2 == {"n": 255, "e": 3, "c": 16, "p": 3, "q": 5, "dp": 7, "dq": 9})
+    with tempfile.TemporaryDirectory() as td:
+        fp = os.path.join(td, "level.py")
+        with open(fp, "w") as fh:
+            fh.write(txt)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = run(["rsa", "-f", fp])
+        check("rsa cli: -f file -> flag highlighted", rc == 0 and ">>> FLAG: flag{rsa_lane_ok}" in buf.getvalue()
+              and "m (hex)" in buf.getvalue())
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = run(["rsa", "--n", hex(nw), "--e", "65537", "--c", hex(enc(m_int, 65537, nw))])
+        check("rsa cli: failure lists attacks + manual hints", rc == 1 and "(d) Wiener" in buf.getvalue()
+              and "what to try manually" in buf.getvalue())
     return ok
 
 
@@ -342,6 +750,8 @@ _USAGE = """usage: crypto <cmd> [args]
   vigenere <text>             break Vigenere without key
   ecb <hex>                   detect repeated 16-byte blocks
   subst <text> [mapping]      substitution helper (mapping: 'a=e,b=t' or 26-char string)
+  rsa --n N --e E --c C | -f FILE   RSA attacks: known p/q, factor small n, small-e root, Wiener, dp/dq leak
+                              (extra: --p --q --dp --dq --d; values decimal or 0x hex)
   selftest                    run self-tests
 Use '-' as the argument to read from stdin."""
 
@@ -354,6 +764,8 @@ def run(args: list[str]) -> int:
     cmd, rest = args[0], args[1:]
     if cmd in ("selftest", "--selftest"):
         return 0 if selftest() else 1
+    if cmd == "rsa":
+        return _rsa_cli(rest)
     if not rest:
         print(_USAGE)
         return 2

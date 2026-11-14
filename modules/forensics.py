@@ -13,7 +13,7 @@ import sys
 import zlib
 
 NAME = "forensics"
-DESCRIPTION = "PCAP parse/streams/HTTP/keyword hunt, JPEG EXIF/PNG/PDF metadata, magic-header repair"
+DESCRIPTION = "PCAP parse/streams/payload strings/HTTP/keyword hunt, raw carve, JPEG EXIF/PNG/PDF metadata, magic-header repair"
 
 KEYWORDS = (b"flag{", b"ctf{", b"password", b"passwd", b"secret", b"key", b"token", b"BEGIN PRIVATE KEY",
             b"BEGIN RSA", b"aes", b"authorization:")
@@ -181,6 +181,58 @@ def strings(data: bytes, minlen: int = 6) -> list[str]:
     return [m.decode("latin-1") for m in re.findall(rb"[\x20-\x7e\t]{%d,}" % minlen, data)]
 
 
+FLAG_RE = re.compile(rb"[A-Za-z0-9_\-]{2,24}\{[\x21-\x7a\x7c\x7e]{1,200}\}")
+RUN_RE = re.compile(rb"[\x20-\x7e]{6,}")
+MAX_RUNS = 200  # printed per stream; the rest are summarised
+
+
+def carve_strings(data: bytes, minlen: int = 6) -> dict:
+    """Scan raw bytes for printable-ASCII runs (>= ``minlen``) and flag-shaped strings (``word{...}``).
+    Returns {'flags': [str, ...] (first-seen order, unique), 'runs': [str, ...] (runs in file order)}."""
+    run_re = RUN_RE if minlen == 6 else re.compile(rb"[\x20-\x7e]{%d,}" % minlen)
+    flags: list[str] = []
+    for m in FLAG_RE.finditer(data):
+        f = m.group().decode("latin-1")
+        if f not in flags:
+            flags.append(f)
+    return {"flags": flags, "runs": [m.group().decode("latin-1") for m in run_re.finditer(data)]}
+
+
+def udp_streams(pkts: list[dict]) -> dict:
+    """Group UDP payloads by directional 4-tuple (src, sport, dst, dport); payloads joined in time order
+    (ties broken by capture order). Returns {(src, sport, dst, dport): bytes}."""
+    groups: dict = {}
+    for p in pkts:
+        if p["proto"] == "UDP" and p["data"]:
+            groups.setdefault((p["src"], p["sport"], p["dst"], p["dport"]), []).append((p["ts"], p["no"], p["data"]))
+    return {k: b"".join(d for _, _, d in sorted(v, key=lambda t: (t[0], t[1]))) for k, v in groups.items()}
+
+
+def stream_strings(pkts: list[dict], minlen: int = 6) -> list[dict]:
+    """Reassemble payloads in stream order (TCP by seq per direction, UDP by time) and carve printable runs.
+    Returns a list of {'label', 'size', 'flags', 'runs'} for every non-empty stream direction."""
+    out = []
+    for k, s in tcp_streams(pkts).items():
+        for dirn, (src, sp, dst, dp) in (("c2s", (k[0], k[1], k[2], k[3])), ("s2c", (k[2], k[3], k[0], k[1]))):
+            if s[dirn]:
+                out.append({"label": f"TCP {src}:{sp} -> {dst}:{dp}", "size": len(s[dirn]),
+                            **carve_strings(s[dirn], minlen)})
+    for (src, sp, dst, dp), buf in udp_streams(pkts).items():
+        out.append({"label": f"UDP {src}:{sp} -> {dst}:{dp}", "size": len(buf), **carve_strings(buf, minlen)})
+    return out
+
+
+def _print_carved(label: str, size: int, res: dict) -> None:
+    """Print one carve result: flag-shaped strings first, then printable runs (capped at MAX_RUNS)."""
+    print(f"\n--- {label} ({size} B): {len(res['flags'])} flag-shaped, {len(res['runs'])} runs ---")
+    for f in res["flags"]:
+        print(f"  [FLAG?] {f}")
+    for r in res["runs"][:MAX_RUNS]:
+        print(f"  {r[:300]}")
+    if len(res["runs"]) > MAX_RUNS:
+        print(f"  ... {len(res['runs']) - MAX_RUNS} more runs not shown")
+
+
 def find_keywords(data: bytes, ctx: int = 1, keywords=KEYWORDS) -> list[tuple[str, str]]:
     """Return (keyword, context lines) for each line containing a keyword (case-insensitive)."""
     lines = re.split(rb"\r?\n", data)
@@ -244,7 +296,7 @@ def _dechunk(b: bytes) -> bytes:
 def analyze_pcap(data: bytes, ctx: int = 1) -> dict:
     pkts = parse_pcap(data)
     streams = tcp_streams(pkts)
-    rep = {"packets": pkts, "streams": streams, "http": {}, "hits": {}}
+    rep = {"packets": pkts, "streams": streams, "http": {}, "hits": {}, "stream_strings": stream_strings(pkts)}
     for k, s in streams.items():
         h = http_objects(s["c2s"], s["s2c"])
         if h:
@@ -380,6 +432,13 @@ def _print_pcap(rep: dict, a) -> None:
     if a.packets or not (a.streams or a.http or a.flags):
         for p in rep["packets"]:
             print(f"{p['no']:>4} {p['ts']:.6f} {p['src']}:{p['sport']} -> {p['dst']}:{p['dport']} {p['proto']} len={p['length']}")
+        print("\n== stream strings (reassembled payload, printable runs >= 6; flag-shaped first) ==")
+        any_stream = False
+        for sres in rep["stream_strings"]:
+            any_stream = True
+            _print_carved(sres["label"], sres["size"], sres)
+        if not any_stream:
+            print("  (no TCP/UDP payload)")
     if a.streams or not (a.packets or a.http or a.flags):
         for i, (k, s) in enumerate(rep["streams"].items()):
             print(f"\n== stream {i}: {k[0]}:{k[1]} <-> {k[2]}:{k[3]}  c2s={len(s['c2s'])}B s2c={len(s['s2c'])}B ==")
@@ -414,8 +473,10 @@ def run(args: list[str]) -> int:
     """CLI entry point (registry contract); returns a process exit code."""
     if args[:1] == ["selftest"]:
         return 0 if selftest() else 1
+    if args[:1] == ["carve"]:
+        return _carve_cmd(args[1:])
     p = argparse.ArgumentParser(prog="recon.py forensics", description=DESCRIPTION)
-    p.add_argument("file", nargs="?")
+    p.add_argument("file", nargs="?", help="capture/file to analyse (or: `carve <file>` for raw printable-run/flag carve)")
     p.add_argument("--packets", action="store_true", help="list packets")
     p.add_argument("--streams", action="store_true", help="dump reassembled TCP streams")
     p.add_argument("--http", action="store_true", help="list HTTP objects")
@@ -439,6 +500,25 @@ def run(args: list[str]) -> int:
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+
+def _carve_cmd(args: list[str]) -> int:
+    """``forensics carve <file> [-n MIN]``: printable runs + flag-shaped strings from any file's raw bytes."""
+    p = argparse.ArgumentParser(prog="recon.py forensics carve", description=carve_strings.__doc__)
+    p.add_argument("file")
+    p.add_argument("-n", "--min", type=int, default=6, help="minimum run length (default 6)")
+    try:
+        a = p.parse_args(args)
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else 2
+    try:
+        with open(a.file, "rb") as fh:
+            data = fh.read()
+    except OSError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    _print_carved(a.file, len(data), carve_strings(data, max(1, a.min)))
+    return 0
 
 
 def _dispatch(a: argparse.Namespace) -> int:
@@ -476,6 +556,13 @@ def _eth_ip_tcp(src, dst, sp, dp, seq, payload: bytes, flags=0x18) -> bytes:
     tcp = struct.pack(">HHIIBBHHH", sp, dp, seq, 0, 5 << 4, flags, 8192, 0, 0) + payload
     ip = struct.pack(">BBHHHBBH4s4s", 0x45, 0, 20 + len(tcp), 1, 0, 64, 6, 0,
                      socket.inet_aton(src), socket.inet_aton(dst)) + tcp
+    return b"\0" * 12 + b"\x08\x00" + ip
+
+
+def _eth_ip_udp(src, dst, sp, dp, payload: bytes) -> bytes:
+    udp = struct.pack(">HHHH", sp, dp, 8 + len(payload), 0) + payload
+    ip = struct.pack(">BBHHHBBH4s4s", 0x45, 0, 20 + len(udp), 1, 0, 64, 17, 0,
+                     socket.inet_aton(src), socket.inet_aton(dst)) + udp
     return b"\0" * 12 + b"\x08\x00" + ip
 
 
@@ -532,6 +619,26 @@ def selftest() -> bool:
         trunc_ok = True
     check("pcap: truncated header -> ValueError (no struct.error leak)", trunc_ok)
 
+    # stream-string carve: TCP (out-of-order) + UDP (out-of-time-order)
+    ss = {x["label"]: x for x in rep["stream_strings"]}
+    s2c = ss.get("TCP 10.0.0.2:80 -> 10.0.0.1:4444", {"flags": [], "runs": []})
+    check("carve: TCP s2c flag-shaped found", s2c["flags"] == ["flag{pcap_streams_ok}"])
+    check("carve: TCP c2s run listed", any("GET /login" in r for r in ss["TCP 10.0.0.1:4444 -> 10.0.0.2:80"]["runs"]))
+    ud = [_eth_ip_udp("10.0.0.3", "10.0.0.4", 5353, 9999, b"xx\x00CTF{udp_"), _eth_ip_udp("10.0.0.3", "10.0.0.4", 5353, 9999, b"ordered}\x01ab")]
+    upc = struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)
+    for ts, f in ((1700000009, ud[1]), (1700000001, ud[0])):  # later packet captured first
+        upc += struct.pack("<IIII", ts, 0, len(f), len(f)) + f
+    us = stream_strings(parse_pcap(upc))
+    check("carve: UDP joined in time order", len(us) == 1 and us[0]["flags"] == ["CTF{udp_ordered}"])
+    cv = carve_strings(b"\x00\x01abc\x00hello world\xffpicoCTF{raw_bytes}\x00zz")
+    check("carve: raw bytes runs>=6 + flag first", cv["flags"] == ["picoCTF{raw_bytes}"] and cv["runs"] == ["hello world", "picoCTF{raw_bytes}"])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _print_pcap(rep, argparse.Namespace(packets=False, streams=False, http=False, flags=False, extract=None))
+    out = buf.getvalue()
+    check("cli: default output keeps packet list and adds stream strings",
+          "10.0.0.1:4444 -> 10.0.0.2:80 TCP" in out and "== stream strings" in out and "[FLAG?] flag{pcap_streams_ok}" in out)
+
     jpg = b"\xff\xd8\xff\xe1\x00\x10Exif\0\0II*\0\x08\x00\xff\xd9"  # truncated EXIF
     check("exif: truncated JPEG handled gracefully", isinstance(jpeg_exif(jpg), dict))
     check("exif: non-JPEG -> {}", jpeg_exif(b"hello") == {})
@@ -554,8 +661,8 @@ def selftest() -> bool:
     check("repair: missing magic prepended", f == png)
     check("repair: unknown type raises", _raises(lambda: repair_header(b"x", "nope")))
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        codes = (run([]), run(["-h"]), run(["--bogus"]), run(["/nonexistent/x.pcap"]))
-    check("cli: bare/-h -> 0, bad flag -> 2, missing file -> 1", codes == (0, 0, 2, 1))
+        codes = (run([]), run(["-h"]), run(["--bogus"]), run(["/nonexistent/x.pcap"]), run(["carve", "/nonexistent/x"]))
+    check("cli: bare/-h -> 0, bad flag -> 2, missing file -> 1 (also for carve)", codes == (0, 0, 2, 1, 1))
     return all(ok)
 
 

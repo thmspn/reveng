@@ -6,14 +6,21 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import io
+import os
+import posixpath
+import re
 import shutil
 import struct
 import subprocess
 import sys
+import tempfile
+import zipfile
+import zlib
 
 NAME = "binextras"
-DESCRIPTION = "Cyclic pattern gen/offset, ROP gadget finder, binwalk-style carving, pack/hexdump helpers"
+DESCRIPTION = "Cyclic pattern gen/offset, ROP gadget finder, binwalk-style carving, recursive archive extract, pack/hexdump helpers"
 
 # --------------------------------------------------------------------------- cyclic pattern
 
@@ -307,6 +314,267 @@ def carve(data: bytes, offset: int, length: int = None) -> bytes:
     return data[offset:end]
 
 
+# --------------------------------------------------------------------------- recursive archive extraction
+
+MAX_DEPTH = 10                 # default recursion cap
+MAX_FILE_BYTES = 256 << 20     # per extracted file (decompression-bomb guard)
+MAX_TOTAL_BYTES = 1 << 30      # per run
+MAX_FILES = 2000               # per run
+FLAG_RE = re.compile(rb"[A-Za-z0-9_\-]{2,24}\{[\x21-\x7a\x7c\x7e]{1,200}\}")
+_EOCD = b"PK\x05\x06"
+
+
+def _zip_end(data: bytes, start: int, eocds: list[int]) -> int | None:
+    """Logical end (exclusive) of the zip beginning at ``start``: locate an end-of-central-directory record whose
+    central directory is consistent with ``start`` (cd_pos - cd_offset == start), so zips stored inside the
+    archive, or other archives appended later, are not mistaken for this one. Returns None if no valid end."""
+    for pos in eocds:
+        if pos < start or pos + 22 > len(data):
+            continue
+        cd_size, cd_off = struct.unpack("<II", data[pos + 12:pos + 20])
+        clen = struct.unpack("<H", data[pos + 20:pos + 22])[0]
+        cd_pos = pos - cd_size
+        if cd_pos - cd_off == start and data[cd_pos:cd_pos + 4] in (b"PK\x01\x02", b"PK\x05\x06"):
+            return min(len(data), pos + 22 + clen)
+    return None
+
+
+def _png_end(data: bytes, start: int) -> int | None:
+    """End of a PNG starting at ``start`` (after its IEND chunk + CRC), or None if chunks don't reach IEND."""
+    i = start + 8
+    while i + 12 <= len(data):
+        ln = struct.unpack(">I", data[i:i + 4])[0]
+        typ = data[i + 4:i + 8]
+        if not re.fullmatch(rb"[A-Za-z]{4}", typ) or i + 12 + ln > len(data):
+            return None
+        i += 12 + ln
+        if typ == b"IEND":
+            return i
+    return None
+
+
+def _jpeg_end(data: bytes, start: int) -> int | None:
+    """End of a JPEG starting at ``start``: walk marker segments to SOS, then scan entropy data for the EOI
+    (FFD9 not preceded by a stuffed 00 / restart marker); nested thumbnails sit inside APPn segments so are skipped."""
+    i = start + 2
+    while i + 4 <= len(data):
+        if data[i] != 0xFF:
+            return None
+        mk = data[i + 1]
+        if mk == 0xD9:
+            return i + 2
+        if mk == 0xFF:
+            i += 1
+            continue
+        ln = struct.unpack(">H", data[i + 2:i + 4])[0]
+        i += 2 + ln
+        if mk == 0xDA:  # SOS: entropy-coded data follows
+            while i + 1 < len(data):
+                j = data.find(b"\xff", i)
+                if j < 0 or j + 1 >= len(data):
+                    return None
+                nxt = data[j + 1]
+                if nxt == 0xD9:
+                    return j + 2
+                i = j + 2 if (nxt == 0 or 0xD0 <= nxt <= 0xD7 or nxt == 0xFF) else j
+                if not (nxt == 0 or 0xD0 <= nxt <= 0xD7 or nxt == 0xFF):
+                    break  # another marker segment (e.g. progressive JPEG): resume segment walk at j
+    return None
+
+
+def _gzip_payload(data: bytes, start: int) -> tuple[bytes, int] | None:
+    """Stream-decode a gzip member at ``start``. Returns (decompressed, end_offset) or None when the stream is
+    invalid, truncated, or would exceed MAX_FILE_BYTES."""
+    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        out = d.decompress(memoryview(data)[start:], MAX_FILE_BYTES)
+    except zlib.error:
+        return None
+    if not d.eof:
+        return None
+    return out, len(data) - len(d.unused_data)
+
+
+def find_archives(data: bytes) -> list[dict]:
+    """Locate embedded archives/images with a verified logical end. Returns [{'kind', 'offset', 'end'[, 'payload']}]
+    sorted by offset; ZIP/GZIP at any offset, PNG/JPEG only when embedded (offset > 0). Hits that fall inside an
+    earlier hit's span are dropped (their content is reached by recursion)."""
+    eocds, i = [], data.find(_EOCD)
+    while i != -1:
+        eocds.append(i)
+        i = data.find(_EOCD, i + 1)
+    cands: list[tuple[int, str]] = []
+    for kind, magic in (("zip", b"PK\x03\x04"), ("gzip", b"\x1f\x8b\x08"), ("png", b"\x89PNG\r\n\x1a\n"),
+                        ("jpg", b"\xff\xd8\xff")):
+        j = data.find(magic)
+        while j != -1:
+            if kind in ("png", "jpg") and j == 0:
+                pass
+            else:
+                cands.append((j, kind))
+            j = data.find(magic, j + 1)
+    cands.sort()
+    out: list[dict] = []
+    covered = 0
+    for off, kind in cands:
+        if off < covered:
+            continue
+        hit: dict | None = None
+        if kind == "zip":
+            end = _zip_end(data, off, eocds)
+            hit = {"kind": kind, "offset": off, "end": end} if end else None
+        elif kind == "gzip":
+            g = _gzip_payload(data, off)
+            hit = {"kind": kind, "offset": off, "end": g[1], "payload": g[0]} if g else None
+        elif kind == "png":
+            end = _png_end(data, off)
+            hit = {"kind": kind, "offset": off, "end": end} if end else None
+        else:
+            end = _jpeg_end(data, off)
+            hit = {"kind": kind, "offset": off, "end": end} if end else None
+        if hit:
+            out.append(hit)
+            covered = hit["end"]
+    return out
+
+
+def _safe_name(name: str) -> str:
+    """Reduce an archive-member name to a harmless basename (no directories, no traversal, no odd chars)."""
+    base = posixpath.basename(name.replace("\\", "/")) or "member"
+    base = re.sub(r"[^A-Za-z0-9._\-+@]", "_", base).lstrip(".") or "member"
+    return base[:100]
+
+
+def _write_new(outdir: str, name: str, blob: bytes) -> str:
+    """Write ``blob`` to a brand-new file in ``outdir`` (O_EXCL: never overwrites, never follows planted symlinks);
+    on a name clash a numeric suffix is added before the extension. Returns the path written."""
+    stem, dot, ext_ = name.rpartition(".")
+    stem, ext_ = (stem, "." + ext_) if dot else (name, "")
+    for n in range(10000):
+        path = os.path.join(outdir, f"{stem}{'' if n == 0 else '.' + str(n)}{ext_}")
+        try:
+            with open(path, "xb") as fh:
+                fh.write(blob)
+            return path
+        except FileExistsError:
+            continue
+    raise OSError(f"could not find a free filename for {name!r} in {outdir}")
+
+
+class _Extractor:
+    """State for one recursive extraction run (sha256 loop guard, size/count budgets, flag collection)."""
+
+    def __init__(self, outdir: str, max_depth: int):
+        self.outdir, self.max_depth = outdir, max_depth
+        self.seen: set[str] = set()
+        self.flags: dict[str, str] = {}  # flag -> path of first file containing it
+        self.files = 0
+        self.total = 0
+
+    def _emit(self, parent: dict, name: str, blob: bytes, label: str, depth: int, hunt_flags: bool = True) -> None:
+        """Record one extracted blob as a child node: dedupe by sha256, write it, hunt flags (unless ``hunt_flags`` is
+        False), then recurse."""
+        sha = hashlib.sha256(blob).hexdigest()
+        node = {"name": name, "label": label, "size": len(blob), "sha": sha[:12], "children": [], "note": ""}
+        parent["children"].append(node)
+        if sha in self.seen:
+            node["note"] = "duplicate sha256, skipped (loop guard)"
+            return
+        if self.files >= MAX_FILES or self.total + len(blob) > MAX_TOTAL_BYTES:
+            node["note"] = "extraction budget exhausted, not written"
+            return
+        self.seen.add(sha)
+        path = _write_new(self.outdir, name, blob)
+        node["path"] = path
+        self.files += 1
+        self.total += len(blob)
+        for m in (FLAG_RE.finditer(blob) if hunt_flags else ()):  # zip carves: members are checked individually
+            f = m.group().decode("latin-1")
+            self.flags.setdefault(f, path)
+            node["note"] = (node["note"] + " " if node["note"] else "") + f"FLAG {f}"
+        self.scan(blob, node, depth + 1, os.path.basename(path))
+
+    def scan(self, data: bytes, node: dict, depth: int, stem: str) -> None:
+        """Find archives in ``data`` and extract each into ``node['children']``, recursing up to ``max_depth``."""
+        hits = find_archives(data)
+        if not hits:
+            return
+        if depth > self.max_depth:
+            node["note"] = (node["note"] + " " if node["note"] else "") + f"depth cap {self.max_depth} reached; not descending"
+            return
+        for h in hits:
+            off, end = h["offset"], h["end"]
+            tag = f"{stem}@0x{off:x}"
+            if h["kind"] == "gzip":
+                self._emit(node, _safe_name(tag) + ".gunzip", h["payload"], f"gzip @0x{off:x}-0x{end:x} (decompressed)", depth)
+            elif h["kind"] == "zip":
+                if off == 0 and end == len(data):  # whole-file zip: no separate carve, just its members
+                    self._zip_members(data, node, depth, tag)
+                else:  # carve it; recursing into the carved file then extracts its members
+                    self._emit(node, _safe_name(tag) + ".zip", data[off:end], f"zip @0x{off:x}-0x{end:x}", depth,
+                               hunt_flags=False)
+            else:
+                self._emit(node, _safe_name(tag) + "." + h["kind"], data[off:end], f"{h['kind']} @0x{off:x}-0x{end:x}", depth)
+
+    def _zip_members(self, blob: bytes, holder: dict, depth: int, tag: str) -> None:
+        """Extract members of the zip ``blob`` as children of ``holder`` (encrypted/oversized/odd members noted)."""
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(blob))
+        except zipfile.BadZipFile as exc:
+            holder["note"] = (holder["note"] + " " if holder["note"] else "") + f"unreadable zip ({exc})"
+            return
+        with zf:
+            for zi in zf.infolist():
+                if zi.is_dir():
+                    continue
+                label = f"member {zi.filename!r}"
+                if zi.flag_bits & 1:
+                    holder["children"].append({"name": _safe_name(zi.filename), "label": label, "size": zi.file_size,
+                                               "sha": "", "children": [], "note": "encrypted, skipped"})
+                    continue
+                if zi.file_size > MAX_FILE_BYTES:
+                    holder["children"].append({"name": _safe_name(zi.filename), "label": label, "size": zi.file_size,
+                                               "sha": "", "children": [], "note": "too large, skipped"})
+                    continue
+                try:
+                    with zf.open(zi) as fh:
+                        content = fh.read(MAX_FILE_BYTES + 1)
+                except (zipfile.BadZipFile, NotImplementedError, RuntimeError, zlib.error, OSError) as exc:
+                    holder["children"].append({"name": _safe_name(zi.filename), "label": label, "size": zi.file_size,
+                                               "sha": "", "children": [], "note": f"unreadable: {exc}"})
+                    continue
+                if len(content) > MAX_FILE_BYTES:
+                    continue
+                self._emit(holder, _safe_name(zi.filename), content, label, depth)
+
+
+def extract_recursive(data: bytes, outdir: str, root_name: str = "input", max_depth: int = MAX_DEPTH) -> dict:
+    """Carve every embedded zip/gzip (and embedded png/jpg) out of ``data`` into ``outdir`` and recurse into each
+    extracted file (depth cap ``max_depth``, sha256 loop guard). ``outdir`` is created if missing and existing
+    files are never overwritten. Returns {'tree': node, 'flags': {flag: path}, 'files': int}."""
+    if os.path.exists(outdir) and not os.path.isdir(outdir):
+        raise ValueError(f"output path {outdir!r} exists and is not a directory")
+    os.makedirs(outdir, exist_ok=True)
+    ex = _Extractor(outdir, max_depth)
+    root = {"name": root_name, "label": "input", "size": len(data), "sha": hashlib.sha256(data).hexdigest()[:12],
+            "children": [], "note": ""}
+    ex.seen.add(hashlib.sha256(data).hexdigest())
+    ex.scan(data, root, 1, _safe_name(root_name))
+    return {"tree": root, "flags": ex.flags, "files": ex.files}
+
+
+def format_tree(node: dict, prefix: str = "", last: bool = True, top: bool = True) -> str:
+    """Render the extraction tree with box-drawing branches."""
+    desc = f"{node['name']}  [{node['label']}, {node['size']} B" + (f", sha256:{node['sha']}" if node["sha"] else "") + "]"
+    if node["note"]:
+        desc += f"  <-- {node['note']}"
+    lines = [desc if top else f"{prefix}{'└── ' if last else '├── '}{desc}"]
+    kids = node["children"]
+    for i, ch in enumerate(kids):
+        lines.append(format_tree(ch, "" if top else prefix + ("    " if last else "│   "), i == len(kids) - 1, False))
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------------------- pack/unpack + hexdump
 
 _FMT = {8: "B", 16: "H", 32: "I", 64: "Q"}
@@ -375,6 +643,11 @@ def run(args: list[str]) -> int:
     cv.add_argument("-o", "--out", required=True)
     cv.add_argument("-l", "--length", type=lambda x: int(x, 0))
 
+    ex = sub.add_parser("extract", help="recursively carve embedded zip/gzip (and png/jpg) archives into OUTDIR")
+    ex.add_argument("file")
+    ex.add_argument("-o", "--out", required=True, metavar="OUTDIR", help="output directory (created if missing; files are never overwritten)")
+    ex.add_argument("--depth", type=int, default=MAX_DEPTH, help=f"recursion cap (default {MAX_DEPTH})")
+
     hd = sub.add_parser("hexdump", help="hexdump a file (or a slice of it)")
     hd.add_argument("file")
     hd.add_argument("-o", "--offset", type=lambda x: int(x, 0), default=0)
@@ -439,6 +712,18 @@ def _dispatch(a: argparse.Namespace) -> int:
         with open(a.out, "wb") as fh:
             fh.write(blob)
         print(f"carved {len(blob)} bytes to {a.out}")
+        return 0
+    if a.cmd == "extract":
+        with open(a.file, "rb") as fh:
+            data = fh.read()
+        res = extract_recursive(data, a.out, os.path.basename(a.file), max(1, a.depth))
+        if not res["tree"]["children"]:
+            print("no embedded zip/gzip archives found (try `scan`, then `carve` by offset)")
+            return 0
+        print(format_tree(res["tree"]))
+        print(f"\n{res['files']} file(s) written to {a.out}")
+        for flag, path in res["flags"].items():
+            print(f"\n>>> FLAG: {flag}   (in {path})")
         return 0
     if a.cmd == "hexdump":
         with open(a.file, "rb") as fh:
@@ -613,6 +898,100 @@ def selftest() -> bool:
     dump = hexdump(b"flag{hex}", width=8)
     check("hexdump: contains ascii column", "|flag{hex" in dump)
     check("hexdump: contains hex bytes", "66 6c 61 67" in dump)
+
+
+    # --- recursive extraction: matryoshka fixtures synthesized in memory, written only into a temp dir
+    def mk_png(extra: bytes = b"") -> bytes:
+        def chunk(t: bytes, b: bytes) -> bytes:
+            return struct.pack(">I", len(b)) + t + b + struct.pack(">I", zlib.crc32(t + b) & 0xFFFFFFFF)
+        return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00")) + chunk(b"IEND", b"")) + extra
+
+    def mk_zip(members: dict, compress=zipfile.ZIP_DEFLATED) -> bytes:
+        bio = io.BytesIO()
+        with zipfile.ZipFile(bio, "w", compress) as z:
+            for k, v in members.items():
+                z.writestr(k, v)
+        return bio.getvalue()
+
+    def mk_gz(payload: bytes) -> bytes:
+        c = zlib.compressobj(9, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+        return c.compress(payload) + c.flush()
+
+    flag = b"CTF{matryoshka_depth_3}"
+    layer3 = mk_zip({"flag.txt": b"you made it: " + flag + b"\n"})
+    layer2 = mk_png(layer3)
+    layer1 = mk_zip({"inner/../../evil.png": layer2, "readme.txt": b"nothing here"})
+    top_file = mk_png(layer1)
+    check("extract: archive ends located (zip end exact)", [h["kind"] for h in find_archives(top_file)] == ["zip"]
+          and find_archives(top_file)[0]["end"] == len(top_file))
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "out", "nested")  # does not exist yet -> created
+        res = extract_recursive(top_file, out, "pic.png")
+        check("extract: OUTDIR created", os.path.isdir(out))
+        check("extract: flag found 3 layers deep", flag.decode() in res["flags"])
+        txt = format_tree(res["tree"])
+        check("extract: tree shows every layer", txt.count("zip @") == 2 and "flag.txt" in txt and "FLAG " + flag.decode() in txt)
+        names = sorted(os.listdir(out))
+        check("extract: zip-slip member name flattened inside OUTDIR", "evil.png" in names
+              and not os.path.exists(os.path.join(td, "evil.png")) and not os.path.exists(os.path.join(td, "out", "evil.png")))
+        before = {n: open(os.path.join(out, n), "rb").read() for n in names}
+        res2 = extract_recursive(top_file, out, "pic.png")
+        after_names = set(os.listdir(out))
+        check("extract: rerun never overwrites (originals intact, new files suffixed)",
+              all(open(os.path.join(out, n), "rb").read() == v for n, v in before.items())
+              and len(after_names) == 2 * len(names) and res2["files"] == res["files"])
+        fpath = os.path.join(td, "afile")
+        open(fpath, "wb").write(b"x")
+        check("extract: OUTDIR that is a regular file refused", _raises(lambda: extract_recursive(top_file, fpath)))
+
+        # gzip: junk + gzip (with trailing junk after it) -> logical end detected, payload decompressed
+        gz = mk_gz(b"hello " + flag + b" bye")
+        blob = b"JUNK" * 5 + gz + b"TRAILER-NOT-PART-OF-GZIP"
+        hits = find_archives(blob)
+        check("extract: gzip logical end via stream decode", len(hits) == 1 and hits[0]["kind"] == "gzip"
+              and hits[0]["offset"] == 20 and blob[hits[0]["end"]:] == b"TRAILER-NOT-PART-OF-GZIP")
+        out2 = os.path.join(td, "gz")
+        r3 = extract_recursive(blob, out2, "blob.bin")
+        check("extract: gzip payload written + flag surfaced", flag.decode() in r3["flags"] and r3["files"] == 1)
+
+        # gzip nested in zip nested in gzip (mixed kinds) and loop guard on identical siblings
+        mixed = mk_gz(mk_zip({"a.gz": mk_gz(b"deep " + flag)}))
+        r4 = extract_recursive(b"HDR" + mixed, os.path.join(td, "mixed"), "m.bin")
+        check("extract: gzip -> zip -> gzip chain", flag.decode() in r4["flags"])
+        twin = mk_gz(b"same payload twice")
+        r5 = extract_recursive(twin + b"--" + twin, os.path.join(td, "dup"), "d.bin")
+        check("extract: identical sha256 skipped by loop guard", "duplicate" in format_tree(r5["tree"]) and r5["files"] == 1)
+
+        # depth cap: 6 nested gzips with cap 3 stops descending and says so
+        nest = b"core " + flag
+        for _ in range(6):
+            nest = mk_gz(nest + b"")
+            nest = b"PAD" + nest
+        r6 = extract_recursive(nest, os.path.join(td, "deep"), "n.bin", max_depth=3)
+        check("extract: depth cap honoured (flag unreachable, note printed)",
+              not r6["flags"] and "depth cap 3" in format_tree(r6["tree"]) and r6["files"] == 3)
+        r7 = extract_recursive(nest, os.path.join(td, "deep10"), "n.bin")
+        check("extract: default cap 10 reaches the flag through 6 layers", flag.decode() in r7["flags"])
+
+        # corrupt / truncated archives and sig false positives are skipped, not crashed on
+        bad = b"PK\x03\x04" + b"\x00" * 30 + b"\x1f\x8b\x08" + b"\xff" * 10
+        check("extract: bogus signatures yield no hits", find_archives(bad) == [])
+        enc = bytearray(mk_zip({"s.txt": b"secret"}))
+        eo = enc.find(b"PK\x03\x04")
+        enc[eo + 6] |= 1  # set encrypted flag in local header
+        cd = enc.find(b"PK\x01\x02")
+        enc[cd + 8] |= 1
+        r8 = extract_recursive(bytes(enc), os.path.join(td, "enc"), "e.zip")
+        check("extract: encrypted member noted, no crash", "encrypted" in format_tree(r8["tree"]))
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            src = os.path.join(td, "cli_in.bin")
+            open(src, "wb").write(top_file)
+            rc = run(["extract", src, "-o", os.path.join(td, "cli_out")])
+        check("extract: cli prints tree + FLAG banner", rc == 0 and ">>> FLAG: " + flag.decode() in buf.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            codes = (run(["extract", src]), run(["extract", "/nonexistent/x", "-o", os.path.join(td, "z")]))
+        check("extract: cli missing -o -> 2, missing file -> 1", codes == (2, 1))
 
     return all(ok)
 
