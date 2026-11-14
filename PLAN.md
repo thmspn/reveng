@@ -4,8 +4,8 @@ Planning artifact for `toolkit/`. Sonnet-run issues implement one module per PR
 against this plan.
 
 > **Status: COMPLETE (2026-11-14).** All 16 modules (6 original + 10 expansion)
-> are IMPLEMENTED and merged; `python3 toolkit/recon.py --selftest` reports
-> `16/16 modules passed`. Re-integration pass: #42. The optional menu-scaling
+> plus the flagship `revauto` (17 total) are IMPLEMENTED; `python3 toolkit/recon.py --selftest` reports
+> `17/17 modules passed`. Re-integration pass: #42. The optional menu-scaling
 > extras (`CATEGORY` grouping, `recon.py --list`) were not built — see
 > "Menu / README scaling" below.
 
@@ -252,11 +252,11 @@ confirms graceful behavior without `PIL`. Offline, no external files.
 
 ---
 
-## Flagship: `revauto` — SPECCED (issue #44)
+## Flagship: `revauto` — IMPLEMENTED (issues #44, #46)
 
 | # | module | prio | status | one-liner | depends on |
 |---|--------|------|--------|-----------|-----------|
-| 11 | `revauto` | **P0 / flagship** | SPECCED | automated RE analyst: unwrap obfuscated py/js/sh layers (pure transforms only), label what every part does, IOCs + tells; ELF/PE digest via r2 / ghidra / stdlib fallback | triage, disasm, binextras, decode, pwnhelp, batch |
+| 11 | `revauto` | **P0 / flagship** | IMPLEMENTED | automated RE analyst: unwrap obfuscated py/js/sh layers (pure transforms only), label what every part does, IOCs + tells; ELF/PE digest via r2 / ghidra / stdlib fallback | triage, disasm, binextras, decode, pwnhelp, batch |
 
 The full spec, data model, selftest plan and acceptance criteria live in
 [`PLAN-revauto.md`](PLAN-revauto.md) (it is too large for this file). It is
