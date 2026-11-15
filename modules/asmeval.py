@@ -308,6 +308,15 @@ def parse_program(text: str) -> Program:
     body = "\n".join(cleaned)
     prog.bits = 64 if _X64_RE.search(body) else 32
     cur_func: Optional[str] = None
+    if not any(re.match(r"^([0-9a-fA-F]+)\s+<([^>]+)>:$", ln) for ln in cleaned):
+        # Offset-only gdb dump ("<+4>:" lines, no function header): borrow the symbol
+        # branch targets reference (e.g. "<main+41>") so <sym+off> resolution works
+        # (battery ic-99).
+        refs = re.findall(r"<([\w.$@]+)\+\d+>", body)
+        if refs:
+            cur_func = max(set(refs), key=refs.count)
+            prog.labels.setdefault(cur_func, 0)
+            prog.funcs.append(cur_func)
 
     def add_label(name: str) -> None:
         nonlocal cur_func
