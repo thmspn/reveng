@@ -1,4 +1,4 @@
-"""ASMEVAL: static x86 assembly evaluator (AT&T and Intel syntax), for "what is in eax after this
+"""ASMEVAL: static x86 / AArch64 assembly evaluator (AT&T and Intel syntax for x86), for "what is in eax after this
 runs?" / "what does asm1(0x6fa) return?" style questions.
 
 The listing is *parsed* and then interpreted by a small from-scratch evaluator over a whitelist of
@@ -10,6 +10,10 @@ Values are either concrete integers or *unknown* (``?``).  Unknown inputs (for e
 argument you did not supply) propagate through arithmetic; a branch that depends on an unknown flag,
 an unsupported instruction, a call to an outside symbol or the step cap stops evaluation and the
 result is printed honestly as **PARTIAL** with the last known register state.
+
+An AArch64 lane (x0-x30/w0-w30, sp, NZCV; stp/ldp, ldr/str, mov/movz/movk, add/sub/adds/subs/cmp,
+logic, shifts, mul/div, b/b.cond/cbz/cbnz/bl/ret) is selected automatically when the listing parses as
+AArch64 (picoCTF "ARMssembly" ``.S`` files); ``--arg`` maps to w0, w1, ... and the result is w0/x0.
 
 Accepted listings: plain ``.S`` / ``.asm`` text, gdb ``disassemble`` dumps (``0x... <+N>:``), and
 ``objdump -d`` output.  Pure stdlib, fully offline.
@@ -23,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 NAME = "asmeval"
-DESCRIPTION = "Static x86 asm evaluator (AT&T/Intel): final registers, or a function's return value for given args"
+DESCRIPTION = "Static x86 (AT&T/Intel) + AArch64 asm evaluator: final registers, or a function's return value for given args"
 
 DEFAULT_MAX_STEPS = 100_000
 RET_SENTINEL = 0x0DEAD000   # fake return address meaning "returned to the caller"
@@ -232,6 +236,7 @@ class Program:
     syntax: str = "intel"
     bits: int = 32
     funcs: list[str] = field(default_factory=list)
+    arch: str = "x86"
 
 
 def _norm_mnem(m: str, syntax: str) -> tuple[str, Optional[int], Optional[int]]:
@@ -291,6 +296,8 @@ def _strip_comment(s: str) -> str:
 
 def parse_program(text: str) -> Program:
     """Parse a .S/.asm, gdb ``disassemble`` or objdump listing into a :class:`Program`."""
+    if _looks_aarch64(text):
+        return _parse_a64(text)
     lines = text.splitlines()
     cleaned = [_strip_comment(raw).strip() for raw in lines]
     prog = Program()
@@ -847,6 +854,526 @@ class Machine:
             self.status, self.reason = "finished", "ret with no in-file return address"
 
 
+# --------------------------------------------------------------------------- AArch64 lane
+
+_A64_REG_TOK = re.compile(r"(?<![\w.%$])(?:[xw](?:[12]?\d|30)|xzr|wzr)(?![\w.])")
+_A64_MNEMS = {
+    "stp", "ldp", "str", "ldr", "mov", "movz", "movk", "movn", "add", "sub", "adds", "subs", "cmp", "cmn",
+    "tst", "and", "orr", "eor", "mvn", "neg", "mul", "sdiv", "udiv", "lsl", "lsr", "asr", "b", "bl", "ret",
+    "cbz", "cbnz", "nop", "adrp",
+}
+_A64_CONDS = {"eq", "ne", "cs", "hs", "cc", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al"}
+_A64_FLAGS = ("N", "Z", "C", "V")
+_A64_MEMOPS = ("ldr", "str", "ldp", "stp")
+
+
+def _a64_prefix(line: str, cur_func: Optional[str]) -> tuple[Optional[int], Optional[int], Optional[str], str]:
+    """Strip a gdb (``0x.. <+N>:``) or objdump (``addr: word``) prefix -> (addr, offset, symbol, rest)."""
+    m = re.match(r"^(?:(0x[0-9a-fA-F]+)\s*)?<(?:([\w.$@]+))?\+(\d+)>:\s*(.*)$", line)
+    if m:
+        return (int(m.group(1), 16) if m.group(1) else None, int(m.group(3)), m.group(2) or cur_func, m.group(4))
+    m = re.match(r"^(0x[0-9a-fA-F]+):\s*(.*)$", line)
+    if m:
+        return int(m.group(1), 16), None, cur_func, m.group(2)
+    m = re.match(r"^([0-9a-fA-F]+):\s+(?:[0-9a-fA-F]{8}|(?:[0-9a-fA-F]{2}\s+)+)\s*(.*)$", line)
+    if m:
+        return int(m.group(1), 16), None, cur_func, m.group(2)
+    return None, None, cur_func, line
+
+
+def _looks_aarch64(text: str) -> bool:
+    """True when the listing parses as AArch64: xN/wN registers on whitelist-style A64 mnemonics, no x86 syntax."""
+    saw = False
+    for raw in text.splitlines():
+        line = raw.split("//", 1)[0].strip()
+        if not line:
+            continue
+        if re.match(r"^\.(intel|att)_syntax", line):
+            return False
+        if line.startswith("."):
+            continue
+        if re.search(r"%[a-zA-Z]", line):  # AT&T register
+            return False
+        line = _a64_prefix(re.sub(r"^=>\s*", "", line), None)[3]
+        while True:
+            lm = re.match(r"^([A-Za-z_.$][\w.$@]*):\s*(.*)$", line)
+            if not lm:
+                break
+            line = lm.group(2)
+        m = re.match(r"^(\S+)\s*(.*)$", line)
+        if not m:
+            continue
+        mn = m.group(1).lower()
+        if (mn in _A64_MNEMS or mn.startswith("b.")) and _A64_REG_TOK.search(m.group(2)):
+            saw = True
+    return saw
+
+
+def _a64_reg(t: str) -> Optional[tuple]:
+    """Register name -> (kind, index, width); kinds are reg / sp / zr."""
+    t = t.strip().lower()
+    simple = {"sp": ("sp", 31, 64), "wsp": ("sp", 31, 32), "xzr": ("zr", 31, 64), "wzr": ("zr", 31, 32),
+              "fp": ("reg", 29, 64), "lr": ("reg", 30, 64)}
+    if t in simple:
+        return simple[t]
+    m = re.fullmatch(r"([xw])(\d+)", t)
+    if m and int(m.group(2)) <= 30:
+        return ("reg", int(m.group(2)), 64 if m.group(1) == "x" else 32)
+    return None
+
+
+def _a64_op(tok: str) -> tuple:
+    """Parse one AArch64 operand: reg, imm, mem, shift, or sym (label / target text)."""
+    t = tok.strip()
+    r = _a64_reg(t)
+    if r:
+        return r
+    if t.startswith("["):
+        m = re.match(r"^\[\s*([^,\]\s]+)\s*(?:,\s*([^\]]+?))?\s*\](!?)$", t)
+        base = _a64_reg(m.group(1)) if m else None
+        if not m or base is None or base[0] == "zr" or base[2] != 64:
+            raise Stop(f"unsupported address '{t}'")
+        off = 0
+        if m.group(2):
+            n = _try_int(m.group(2).lstrip("#"))
+            if n is None:
+                raise Stop(f"unsupported addressing mode '{t}' (register/extended/symbolic offset)")
+            off = n
+        return ("mem", base, off, "pre" if m.group(3) else "off")
+    m = re.fullmatch(r"(?i)(lsl|lsr|asr|ror)\s+#?(\w+)", t)
+    if m and _try_int(m.group(2)) is not None:
+        return ("shift", m.group(1).lower(), _try_int(m.group(2)))
+    if re.match(r"(?i)^[us]xt[bhwx]\b", t):
+        raise Stop(f"extended-register operand '{t}' is not modelled")
+    n = _try_int(t[1:] if t.startswith("#") else t)
+    if n is not None:
+        return ("imm", n)
+    return ("sym", t)
+
+
+def _parse_a64_insn(line: str, lineno: int) -> Insn:
+    """Parse one AArch64 instruction; problems are stored in ``Insn.err``."""
+    m = re.match(r"^(\S+)\s*(.*)$", line)
+    assert m
+    mn, rest = m.group(1).lower(), m.group(2).strip()
+    ins = Insn(mn, [], None, line, lineno)
+    try:
+        if mn.startswith("b.") or (mn[0] == "b" and mn[1:] in _A64_CONDS and mn != "bl"):
+            cc = mn[2:] if mn.startswith("b.") else mn[1:]
+            if cc not in _A64_CONDS:
+                raise Stop(f"unknown condition '{cc}'")
+            ins.mnem = "bcc"
+            ins.ops = [("cond", cc), ("sym", rest)]
+            return ins
+        ops = [_a64_op(o) for o in _split_ops(rest)]
+        if mn in _A64_MEMOPS and len(ops) >= 2 and ops[-2][0] == "mem" and ops[-1][0] == "imm" \
+                and ops[-2][3] == "off" and ops[-2][2] == 0:
+            ops = ops[:-2] + [("mem", ops[-2][1], ops[-1][1], "post")]
+        ins.ops = ops
+    except Stop as exc:
+        ins.err = str(exc)
+    return ins
+
+
+def _parse_a64(text: str) -> Program:
+    """Parse an AArch64 .S / gdb / objdump listing; directives and comments are skipped."""
+    text = re.sub(r"/\*.*?\*/", lambda m: "\n" * m.group(0).count("\n"), text, flags=re.S)
+    prog = Program(syntax="aarch64", bits=64, arch="aarch64")
+    cur_func: Optional[str] = None
+
+    def add_label(name: str) -> None:
+        nonlocal cur_func
+        prog.labels.setdefault(name, len(prog.insns))
+        if not name.startswith(".") and not name.startswith("L"):
+            cur_func = name
+            prog.funcs.append(name)
+
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = re.sub(r"^=>\s*", "", raw.split("//", 1)[0].strip())
+        if not line or line.lower().startswith("end of assembler dump"):
+            continue
+        m = re.match(r"(?i)^dump of assembler code for function ([^\s:]+):?$", line)
+        if m:
+            add_label(m.group(1))
+            continue
+        m = re.match(r"^([0-9a-fA-F]+)\s+<([^>]+)>:$", line)
+        if m:
+            add_label(m.group(2))
+            continue
+        addr, off, sym, line = _a64_prefix(line, cur_func)
+        while True:
+            lm = re.match(r"^([A-Za-z_.$][\w.$@]*):\s*(.*)$", line)
+            if not lm:
+                break
+            add_label(lm.group(1))
+            line = lm.group(2)
+        if not line or line.startswith("."):
+            continue
+        idx = len(prog.insns)
+        prog.insns.append(_parse_a64_insn(line, lineno))
+        if addr is not None:
+            prog.addr_map[addr] = idx
+        if off is not None and sym:
+            prog.symoff[(sym, off)] = idx
+    return prog
+
+
+def _a64_shift(v: Optional[int], kind: str, n: int, w: int) -> Optional[int]:
+    """Apply an AArch64 shifted-register / immediate shift at width ``w``."""
+    if v is None:
+        return None
+    if n >= w and kind != "ror":
+        return (_mask(w) if (kind == "asr" and v >> (w - 1)) else 0)
+    if kind == "lsl":
+        return (v << n) & _mask(w)
+    if kind == "lsr":
+        return v >> n
+    if kind == "asr":
+        return (_sext(v, w) >> n) & _mask(w)
+    n %= w
+    return ((v >> n) | (v << (w - n))) & _mask(w)
+
+
+def _a64_cond(cc: str, f: dict) -> Optional[bool]:
+    """Evaluate an AArch64 condition code against NZCV; None if a needed flag is unknown."""
+    need = {"eq": "Z", "ne": "Z", "cs": "C", "hs": "C", "cc": "C", "lo": "C", "mi": "N", "pl": "N",
+            "vs": "V", "vc": "V", "hi": "CZ", "ls": "CZ", "ge": "NV", "lt": "NV", "gt": "NZV", "le": "NZV"}
+    if cc == "al":
+        return True
+    if any(f[k] is None for k in need[cc]):
+        return None
+    n, z, c, v = f["N"], f["Z"], f["C"], f["V"]
+    return {"eq": z == 1, "ne": z == 0, "cs": c == 1, "hs": c == 1, "cc": c == 0, "lo": c == 0, "mi": n == 1,
+            "pl": n == 0, "vs": v == 1, "vc": v == 0, "hi": c == 1 and z == 0, "ls": not (c == 1 and z == 0),
+            "ge": n == v, "lt": n != v, "gt": z == 0 and n == v, "le": z == 1 or n != v}[cc]
+
+
+class A64Machine:
+    """Symbolic AArch64 evaluator: x0-x30 (64-bit), wN views, sp, NZCV, byte memory."""
+
+    resolve = Machine.resolve        # branch-target resolution only needs ``self.p``
+    mem_read = Machine.mem_read      # byte-granular little-endian memory with unknown bytes
+    mem_write = Machine.mem_write
+
+    def __init__(self, prog: Program, max_steps: int = DEFAULT_MAX_STEPS) -> None:
+        self.p = prog
+        self.max_steps = max_steps
+        self.amask = _mask(64)
+        self.x: list[Optional[int]] = [None] * 31
+        self.sp: Optional[int] = 0x7FFFFFFFE000
+        self.flags: dict[str, Optional[int]] = {f: None for f in _A64_FLAGS}
+        self.mem: dict[int, Optional[int]] = {}
+        self.ip = 0
+        self.steps = 0
+        self.status = "running"
+        self.reason = ""
+        self.stop_at: Optional[Insn] = None
+
+    # -- operands
+    def rd(self, op: tuple, w: int = 64) -> Optional[int]:
+        """Read a register (at its own width) or an immediate (masked to ``w``)."""
+        k = op[0]
+        if k == "imm":
+            return op[1] & _mask(w)
+        if k == "reg":
+            v: Optional[int] = self.x[op[1]]
+        elif k == "sp":
+            v = self.sp
+        elif k == "zr":
+            v = 0
+        else:
+            raise Stop(f"cannot read operand '{k}'")
+        return None if v is None else v & _mask(op[2])
+
+    def wr(self, op: tuple, val: Optional[int]) -> None:
+        """Write a register; wN writes zero-extend into xN, xzr/wzr discard."""
+        k = op[0]
+        v = None if val is None else val & _mask(op[2] if k != "sp" else 64)
+        if k == "reg":
+            self.x[op[1]] = v
+        elif k == "sp":
+            self.sp = v
+        elif k != "zr":
+            raise Stop("cannot write to this operand")
+
+    def _src(self, ops: list, w: int) -> Optional[int]:
+        """Second source: reg or imm, with an optional trailing shift operand."""
+        if ops[0][0] == "sym":
+            raise Stop(f"symbolic operand '{ops[0][1]}' is not modelled")
+        v = self.rd(ops[0], w)
+        if len(ops) > 1:
+            if ops[1][0] != "shift":
+                raise Stop("unexpected extra operand")
+            v = _a64_shift(v, ops[1][1], ops[1][2], w)
+        return v
+
+    def _setnzcv(self, r: Optional[int], w: int, c: Optional[int], v: Optional[int]) -> None:
+        if r is None:
+            self.flags = {f: None for f in _A64_FLAGS}
+        else:
+            self.flags = {"N": (r >> (w - 1)) & 1, "Z": int(r == 0), "C": c, "V": v}
+
+    # -- execution
+    def step(self) -> None:
+        ins = self.p.insns[self.ip]
+        self.stop_at = ins
+        if ins.err:
+            raise Stop(f"unsupported operand ({ins.err})")
+        fn = getattr(self, "a_" + ins.mnem, None) if ins.mnem.isidentifier() else None
+        if fn is None:
+            raise Stop(f"unsupported instruction '{ins.mnem}'")
+        self.ip += 1
+        try:
+            fn(ins)
+        except IndexError:
+            raise Stop(f"malformed operands for '{ins.mnem}'") from None
+
+    def run(self, entry: int, args: Optional[list[int]] = None) -> None:
+        """Run from ``entry`` as a call with ``args`` in x0/w0, x1/w1, ... (extra args on the stack)."""
+        self.ip = entry
+        args = args or []
+        for i, v in enumerate(args[:8]):
+            self.x[i] = v & _mask(64)
+        for i, v in enumerate(args[8:]):
+            self.mem_write(self.sp + 8 * i, 64, v & _mask(64))  # type: ignore[operator]
+        self.x[30] = RET_SENTINEL
+        try:
+            while self.status == "running":
+                if self.ip < 0 or self.ip >= len(self.p.insns):
+                    self.status, self.reason = "finished", "reached the end of the listing"
+                    break
+                if self.steps >= self.max_steps:
+                    raise Stop(f"step limit ({self.max_steps}) reached - possible long/infinite loop")
+                self.steps += 1
+                self.step()
+        except Stop as exc:
+            self.status, self.reason = "partial", str(exc)
+
+    # -- data movement
+    def a_nop(self, ins: Insn) -> None:
+        pass
+
+    def a_mov(self, ins: Insn) -> None:
+        d, s = ins.ops[0], ins.ops[1]
+        if s[0] == "sym":
+            raise Stop(f"symbolic operand '{s[1]}' is not modelled")
+        self.wr(d, self.rd(s, d[2]))
+
+    def _movw(self, ins: Insn, mode: str) -> None:
+        d, imm = ins.ops[0], ins.ops[1]
+        if imm[0] != "imm":
+            raise Stop("mov-wide needs an immediate")
+        sh = 0
+        if len(ins.ops) > 2:
+            if ins.ops[2][:2] != ("shift", "lsl"):
+                raise Stop("mov-wide expects 'lsl #n'")
+            sh = ins.ops[2][2]
+        v = (imm[1] & 0xFFFF) << sh
+        if mode == "movz":
+            self.wr(d, v)
+        elif mode == "movn":
+            self.wr(d, ~v)
+        else:
+            old = self.rd(d)
+            self.wr(d, None if old is None else (old & ~(0xFFFF << sh)) | v)
+
+    def a_movz(self, ins: Insn) -> None:
+        self._movw(ins, "movz")
+
+    def a_movk(self, ins: Insn) -> None:
+        self._movw(ins, "movk")
+
+    def a_movn(self, ins: Insn) -> None:
+        self._movw(ins, "movn")
+
+    def _addr(self, mem: tuple) -> tuple[Optional[int], Optional[int], bool]:
+        """Memory operand -> (access address, new base value, writeback?)."""
+        if mem[0] != "mem":
+            raise Stop("literal/symbolic load-store addressing is not modelled")
+        _, base, off, mode = mem
+        b = self.rd(base)
+        if b is None:
+            return None, None, mode != "off"
+        a = (b + off) & _mask(64)
+        return (b if mode == "post" else a), a, mode != "off"
+
+    def _ldst(self, ins: Insn, load: bool, pair: bool) -> None:
+        rts = ins.ops[:2] if pair else ins.ops[:1]
+        mem = ins.ops[2] if pair else ins.ops[1]
+        addr, newbase, wb = self._addr(mem)
+        for i, rt in enumerate(rts):
+            size = rt[2]
+            a = None if addr is None else addr + i * (size // 8)
+            if load:
+                self.wr(rt, self.mem_read(a, size))
+            else:
+                self.mem_write(a, size, self.rd(rt))
+        if wb:
+            self.wr(mem[1], newbase)
+
+    def a_ldr(self, ins: Insn) -> None:
+        self._ldst(ins, True, False)
+
+    def a_str(self, ins: Insn) -> None:
+        self._ldst(ins, False, False)
+
+    def a_ldp(self, ins: Insn) -> None:
+        self._ldst(ins, True, True)
+
+    def a_stp(self, ins: Insn) -> None:
+        self._ldst(ins, False, True)
+
+    # -- arithmetic / logic
+    def _arith(self, ins: Insn, kind: str, flags: bool, discard: bool = False) -> None:
+        ops = ins.ops
+        if discard:
+            d, rest = ("zr", 31, ops[0][2]), ops
+        else:
+            d, rest = ops[0], ops[1:]
+        w = d[2]
+        a = self.rd(rest[0])
+        b = self._src(rest[1:], w)
+        r, fl = _alu(kind, a, b, w)
+        if flags:
+            if r is None:
+                self.flags = {f: None for f in _A64_FLAGS}
+            else:
+                c = {"add": fl["CF"], "sub": None if fl["CF"] is None else 1 - fl["CF"]}.get(kind, 0)
+                self._setnzcv(r, w, c, fl["OF"] if kind in ("add", "sub") else 0)
+        self.wr(d, r)
+
+    def a_add(self, ins: Insn) -> None:
+        self._arith(ins, "add", False)
+
+    def a_sub(self, ins: Insn) -> None:
+        self._arith(ins, "sub", False)
+
+    def a_adds(self, ins: Insn) -> None:
+        self._arith(ins, "add", True)
+
+    def a_subs(self, ins: Insn) -> None:
+        self._arith(ins, "sub", True)
+
+    def a_cmp(self, ins: Insn) -> None:
+        self._arith(ins, "sub", True, discard=True)
+
+    def a_cmn(self, ins: Insn) -> None:
+        self._arith(ins, "add", True, discard=True)
+
+    def a_tst(self, ins: Insn) -> None:
+        self._arith(ins, "and", True, discard=True)
+
+    def a_and(self, ins: Insn) -> None:
+        self._arith(ins, "and", False)
+
+    def a_orr(self, ins: Insn) -> None:
+        self._arith(ins, "or", False)
+
+    def a_eor(self, ins: Insn) -> None:
+        self._arith(ins, "xor", False)
+
+    def a_neg(self, ins: Insn) -> None:
+        d = ins.ops[0]
+        v = self._src(ins.ops[1:], d[2])
+        self.wr(d, None if v is None else -v)
+
+    def a_mvn(self, ins: Insn) -> None:
+        d = ins.ops[0]
+        v = self._src(ins.ops[1:], d[2])
+        self.wr(d, None if v is None else ~v)
+
+    def a_mul(self, ins: Insn) -> None:
+        d = ins.ops[0]
+        a, b = self.rd(ins.ops[1]), self.rd(ins.ops[2])
+        self.wr(d, None if a is None or b is None else a * b)
+
+    def _div(self, ins: Insn, signed: bool) -> None:
+        d = ins.ops[0]
+        w = d[2]
+        a, b = self.rd(ins.ops[1]), self.rd(ins.ops[2])
+        if a is None or b is None:
+            self.wr(d, None)
+        elif b == 0:
+            self.wr(d, 0)  # architected: division by zero yields 0
+        elif signed:
+            sa, sb = _sext(a, w), _sext(b, w)
+            q = abs(sa) // abs(sb)
+            self.wr(d, -q if (sa < 0) != (sb < 0) else q)
+        else:
+            self.wr(d, a // b)
+
+    def a_sdiv(self, ins: Insn) -> None:
+        self._div(ins, True)
+
+    def a_udiv(self, ins: Insn) -> None:
+        self._div(ins, False)
+
+    def _shift(self, ins: Insn, kind: str) -> None:
+        d = ins.ops[0]
+        w = d[2]
+        a = self.rd(ins.ops[1])
+        cnt = self.rd(ins.ops[2], w)
+        self.wr(d, None if a is None or cnt is None else _a64_shift(a, kind, cnt & (w - 1), w))
+
+    def a_lsl(self, ins: Insn) -> None:
+        self._shift(ins, "lsl")
+
+    def a_lsr(self, ins: Insn) -> None:
+        self._shift(ins, "lsr")
+
+    def a_asr(self, ins: Insn) -> None:
+        self._shift(ins, "asr")
+
+    # -- control flow
+    def _target(self, op: tuple) -> int:
+        if op[0] != "sym":
+            raise Stop("indirect branch")
+        t = self.resolve(op[1])
+        if t is None:
+            raise Stop(f"branch target '{op[1]}' is not in the parsed file")
+        return t
+
+    def a_b(self, ins: Insn) -> None:
+        self.ip = self._target(ins.ops[0])
+
+    def a_bcc(self, ins: Insn) -> None:
+        taken = _a64_cond(ins.ops[0][1], self.flags)
+        if taken is None:
+            raise Stop(f"'{ins.text}' depends on flags computed from an unknown value "
+                       "(supply the missing input with --arg / --init)")
+        if taken:
+            self.ip = self._target(ins.ops[1])
+
+    def _cb(self, ins: Insn, want_zero: bool) -> None:
+        v = self.rd(ins.ops[0])
+        if v is None:
+            raise Stop(f"'{ins.text}' tests an unknown value (supply the missing input with --arg / --init)")
+        if (v == 0) == want_zero:
+            self.ip = self._target(ins.ops[1])
+
+    def a_cbz(self, ins: Insn) -> None:
+        self._cb(ins, True)
+
+    def a_cbnz(self, ins: Insn) -> None:
+        self._cb(ins, False)
+
+    def a_bl(self, ins: Insn) -> None:
+        tgt = self._target(ins.ops[0])
+        self.x[30] = RET_BASE + self.ip
+        self.ip = tgt
+
+    def a_ret(self, ins: Insn) -> None:
+        lr = self.rd(ins.ops[0]) if ins.ops else self.x[30]
+        if lr == RET_SENTINEL:
+            self.status, self.reason = "returned", "ret to caller"
+        elif lr is not None and RET_BASE <= lr <= RET_BASE + len(self.p.insns):
+            self.ip = lr - RET_BASE
+        elif lr is None:
+            raise Stop("ret with unknown x30 (link register was clobbered or never saved)")
+        else:
+            self.status, self.reason = "finished", "ret with no in-file return address"
+
+
 # --------------------------------------------------------------------------- results / formatting
 
 @dataclass
@@ -861,6 +1388,7 @@ class EvalResult:
     stop_text: str = ""
     stop_line: int = 0
     retval: Optional[int] = None
+    arch: str = "x86"
 
     @property
     def partial(self) -> bool:
@@ -873,8 +1401,12 @@ def evaluate(text: str, args: Optional[list[int]] = None, func: Optional[str] = 
     prog = parse_program(text)
     if not prog.insns:
         raise ValueError("no instructions found in input")
+    if prog.arch == "aarch64":
+        return _evaluate_a64(prog, args, func, max_steps, init)
     m = Machine(prog, max_steps)
     for name, val in (init or {}).items():
+        if name.lower() not in REGS:
+            raise ValueError(f"--init register '{name}' is not an x86 register")
         c, sh, w = REGS[name.lower()]
         m.set_reg(c, sh, w, val & _mask(w))
     if func:
@@ -892,6 +1424,30 @@ def evaluate(text: str, args: Optional[list[int]] = None, func: Optional[str] = 
                       ret)
 
 
+def _evaluate_a64(prog: Program, args: Optional[list[int]], func: Optional[str], max_steps: int,
+                  init: Optional[dict[str, int]]) -> EvalResult:
+    """AArch64 lane of :func:`evaluate`."""
+    m = A64Machine(prog, max_steps)
+    for name, val in (init or {}).items():
+        r = _a64_reg(name)
+        if r is None:
+            raise ValueError(f"--init register '{name}' is not an AArch64 register")
+        m.wr(r, val)
+    if func:
+        if func not in prog.labels:
+            raise ValueError(f"function/label '{func}' not found (have: {', '.join(prog.labels) or 'none'})")
+        entry = prog.labels[func]
+    else:
+        entry = prog.labels[prog.funcs[0]] if prog.funcs else 0
+    m.run(entry, args)
+    regs: dict = {f"x{i}": v for i, v in enumerate(m.x)}
+    regs["sp"] = m.sp
+    st = m.stop_at
+    part = m.status == "partial"
+    return EvalResult(m.status, m.reason, regs, dict(m.flags), m.steps, 64,
+                      st.text if st and part else "", st.line if st and part else 0, m.x[0], "aarch64")
+
+
 def _fmt_val(v: Optional[int], w: int) -> str:
     if v is None:
         return "?"
@@ -902,6 +1458,10 @@ def _fmt_val(v: Optional[int], w: int) -> str:
 
 def format_regs(r: EvalResult) -> str:
     """Human-readable register + flag dump."""
+    if r.arch == "aarch64":
+        out = [f"  {k:<4} = {_fmt_val(v, 64)}" for k, v in r.regs.items() if v is not None or k == "x0"]
+        out.append("  flags: " + " ".join(f"{f}={'?' if r.flags[f] is None else r.flags[f]}" for f in _A64_FLAGS))
+        return "\n".join(out)
     w = r.bits
     names = [(E_NAME[c] if w == 32 else c, c) for c in CANON[:8]]
     if w == 64:
@@ -917,7 +1477,7 @@ def format_regs(r: EvalResult) -> str:
 def report(r: EvalResult, label: str = "", args: Optional[list[int]] = None, regs: bool = True) -> str:
     """Full textual report, honest about partial results."""
     out: list[str] = []
-    rname = "eax" if r.bits == 32 else "rax"
+    rname = "x0" if r.arch == "aarch64" else "eax" if r.bits == 32 else "rax"
     if r.partial:
         out.append("*** PARTIAL RESULT - evaluation stopped early ***")
         out.append(f"stopped at line {r.stop_line}: {r.stop_text}")
@@ -928,7 +1488,12 @@ def report(r: EvalResult, label: str = "", args: Optional[list[int]] = None, reg
     if args is not None:
         fn = label or "func"
         call = f"{fn}({', '.join(hex(a) for a in args)})"
-        if r.retval is None:
+        if r.arch == "aarch64" and r.retval is not None:
+            w0, x0 = r.retval & _mask(32), r.retval
+            tag = " [PARTIAL - last known value]" if r.partial else ""
+            out.append(f"{call} -> w0 = 0x{w0:x}  decimal {w0} unsigned / {_sext(w0, 32)} signed; "
+                       f"x0 = 0x{x0:x}  decimal {x0} unsigned / {_sext(x0, 64)} signed{tag}")
+        elif r.retval is None:
             out.append(f"{call}: {rname} is unknown" + (" (partial)" if r.partial else ""))
         else:
             sv = _sext(r.retval, r.bits)
@@ -972,7 +1537,7 @@ def run(args: list[str]) -> int:
     init: dict[str, int] = {}
     for item in ns.init:
         k, _, v = item.partition("=")
-        if k.lower() not in REGS or _try_int(v) is None:
+        if (k.lower() not in REGS and _a64_reg(k) is None) or _try_int(v) is None:
             print(f"asmeval: bad --init {item!r} (want REG=VALUE)", file=sys.stderr)
             return 2
         init[k.lower()] = _try_int(v)  # type: ignore[assignment]
@@ -1108,6 +1673,112 @@ f:
 """
 
 
+_A64_CHAIN = """
+    .arch armv8-a
+    .text
+    .global f
+    .type f, %function
+f:                              // comment
+    mov w0, #5
+    add w0, w0, #7              /* 12 */
+    mov x1, #0x10
+    lsl x1, x1, #4              // x1 = 256
+    add w0, w0, w1, lsl 1       // 12 + 512
+    sub w0, w0, #4              // 520
+    mov w2, #-1
+    mov x3, #-1
+    add w4, w2, #1              // wraps to 0, zero-extends
+    movz x5, #0x1234
+    movk x5, #0xabcd, lsl 16
+    nop
+    ret
+    .size f, .-f
+"""
+
+_A64_SPILL = """
+g:
+    stp x29, x30, [sp, -32]!
+    add x29, sp, 0
+    str w0, [sp, 28]
+    mov w0, 9
+    str w0, [sp, 24]
+    ldr w1, [sp, 28]
+    ldr w0, [sp, 24]
+    add w0, w1, w0
+    ldp x29, x30, [sp], 32
+    ret
+"""
+
+_A64_SUBSP = """
+s:
+    sub sp, sp, #16
+    str x0, [sp, #8]
+    str wzr, [sp]
+    ldr x1, [sp, #8]
+    add x0, x1, #1
+    add sp, sp, 16
+    ret
+"""
+
+_A64_BRANCH = """
+h:
+    cmp w0, 10
+    b.gt .L1
+    mov w0, 1
+    ret
+.L1:
+    mov w0, 2
+    ret
+"""
+
+_A64_BRANCH_U = """
+h:
+    cmp w0, 10
+    bhi .L1
+    mov w0, 1
+    ret
+.L1:
+    mov w0, 2
+    ret
+"""
+
+_A64_CALL = """
+add2:
+    add w0, w0, w1
+    ret
+main_fn:
+    stp x29, x30, [sp, -16]!
+    mov x29, sp
+    mov w0, 30
+    mov w1, 12
+    bl add2
+    add w0, w0, 1
+    ldp x29, x30, [sp], 16
+    ret
+"""
+
+_A64_LOOP = """
+loop:
+    mov w1, 0
+    mov w2, 0
+.L2:
+    add w1, w1, w2
+    add w2, w2, 1
+    cmp w2, w0
+    b.lt .L2
+    mov w0, w1
+    ret
+"""
+
+_A64_UNSUP = """
+u:
+    mov w0, 7
+    add w0, w0, 1
+    fmov d0, x0
+    add w0, w0, 1
+"""
+
+
 def selftest() -> bool:
     """Exact-value checks on in-memory AT&T/Intel samples; no files, no optional deps."""
     results: list[bool] = []
@@ -1195,6 +1866,56 @@ def selftest() -> bool:
         with contextlib.redirect_stderr(io.StringIO()):
             check("cli missing file", run([os.path.join(td, "nope")]) == 1)
             check("cli usage error", run(["--bogus"]) == 2)
+
+    # ---- AArch64 lane
+    def x(r: EvalResult, n: str) -> Optional[int]:
+        return r.regs[n]
+
+    r = evaluate(_A64_CHAIN)
+    check("a64 detected + complete", r.arch == "aarch64" and r.status == "returned" and not r.partial)
+    check("a64 mov/add/lsl/sub chain w0", x(r, "x0") == 520 and r.retval == 520)
+    check("a64 mov w2,#-1 zero-extends", x(r, "x2") == 0xFFFFFFFF and x(r, "x3") == _mask(64))
+    check("a64 w-write zero-extends", x(r, "x4") == 0 and x(r, "x1") == 256)
+    check("a64 movz/movk", x(r, "x5") == 0xABCD1234)
+
+    r = evaluate(_A64_SPILL, [100])
+    check("a64 stp/ldp spill+reload", r.status == "returned" and r.retval == 109 and x(r, "sp") == 0x7FFFFFFFE000)
+    check("a64 stp saved lr restored", x(r, "x30") == RET_SENTINEL)
+    r = evaluate(_A64_SUBSP, [41])
+    check("a64 sub sp / x spill", r.status == "returned" and r.retval == 42 and x(r, "sp") == 0x7FFFFFFFE000)
+
+    check("a64 b.gt taken", evaluate(_A64_BRANCH, [11]).retval == 2)
+    check("a64 b.gt equal not taken", evaluate(_A64_BRANCH, [10]).retval == 1)
+    check("a64 b.gt signed negative", evaluate(_A64_BRANCH, [-5]).retval & 0xFFFFFFFF == 1)
+    check("a64 bhi unsigned negative", evaluate(_A64_BRANCH_U, [-5]).retval & 0xFFFFFFFF == 2)
+    r = evaluate(_A64_BRANCH)
+    check("a64 unknown arg -> partial", r.partial and "unknown" in r.reason)
+
+    r = evaluate(_A64_CALL, [3, 4])
+    check("a64 two-arg function, default entry", r.status == "returned" and r.retval == 7)
+    r = evaluate(_A64_CALL, func="main_fn")
+    check("a64 bl in file", r.status == "returned" and r.retval == 43 and not r.partial)
+
+    r = evaluate(_A64_LOOP, [10])
+    check("a64 loop sum 0..9", r.status == "returned" and r.retval == 45 and r.steps > 40)
+    r = evaluate(_A64_LOOP, [10], max_steps=20)
+    check("a64 bounded unrolling stops honestly", r.partial and "step limit" in r.reason)
+
+    r = evaluate(_A64_UNSUP)
+    check("a64 unsupported insn partial", r.partial and "fmov" in r.reason and x(r, "x0") == 8)
+    check("a64 partial report", "PARTIAL" in report(r) and "fmov d0, x0" in report(r))
+    r = evaluate("c:\n    mov w0, 1\n    bl printf\n")
+    check("a64 call outside file partial", r.partial and "printf" in r.reason)
+    check("x86 lane unaffected", evaluate(_INTEL_LOOP).arch == "x86")
+
+    with tempfile.TemporaryDirectory() as td2:
+        path = os.path.join(td2, "arm.S")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(_A64_BRANCH)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = run([path, "--arg", "11"])
+        check("a64 cli arg mode", rc == 0 and "w0 = 0x2" in buf.getvalue())
     return all(results)
 
 
