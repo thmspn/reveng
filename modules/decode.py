@@ -346,7 +346,7 @@ def hints(s: str) -> list[str]:
                 out.append(f"letters only, index of coincidence {ic:.3f} (~0.038 = random): polyalphabetic (Vigenere) likely; need a key (--vigenere KEY)")
         else:
             out.append("already reads like English plaintext")
-    if re.fullmatch(r"[A-Za-z0-9{}_]+", compact) and re.search(r"\w+\{.+\}", compact):
+    if re.fullmatch(r"[A-Za-z0-9{}_]+", compact) and _RESULT_FLAG_RE.search(compact.encode("ascii")):
         out.append("flag-like format word{...}: if gibberish inside, try --rot / --atbash on it")
     if re.fullmatch(r"[0-9a-fA-F]+", compact) and n % 2 == 0 and n >= 4:
         out.append("if hex decodes to unreadable bytes: try --xor-brute (single-byte XOR)")
