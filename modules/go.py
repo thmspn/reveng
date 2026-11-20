@@ -18,7 +18,11 @@ Chain (siblings are called in-process through the registry; their stdout is capt
 
 Every step has a wall-clock timeout (--step-timeout, default 20s) and the whole run a budget (--budget,
 default 180s). Output ends with "== FLAG CANDIDATES ==" (deduped, ranked, each tagged with the step that
-saw it) and one status line per step. Exit 0 if any candidate was found, 1 if none, 2 on usage errors.
+saw it), "== DERIVED INPUTS / REGISTER RESULTS ==" (exact evidence quoted from autosolve / pyrun / asmeval,
+each with source and confidence; these are NOT flags), one status line per step ("ok" = the tool ran, not
+that it solved anything) and, when nothing flag-shaped was found, a short next-step hint.
+Exit 0 if any flag candidate was found, 1 if none (derived evidence does not change the exit code), 2 on
+usage errors.
 Fully offline; nothing here opens a socket or executes the input directly (pyrun does its own guarded run).
 """
 from __future__ import annotations
@@ -81,6 +85,72 @@ class Candidate:
     order: int = 0
 
 
+@dataclass
+class Derived:
+    """Evidence a sibling printed that is not flag-shaped: a derived input/password or a register result."""
+    kind: str                   # "derived input" | "derived value" | "register result"
+    text: str                   # exact text as the sibling printed it
+    source: str                 # step label
+    conf: str                   # HIGH/MEDIUM/LOW (autosolve/pyrun) or complete/PARTIAL (asmeval)
+    note: str = ""
+
+
+_AUTO_SOLVE_RE = re.compile(r"^\s*SOLVE\s+(.+?)\s+\[([HML?])\]\s+method\s+(\S+)", re.M)
+_AUTO_HEAD_RE = re.compile(r"^\s*HEADLINE\s+DERIVED\s+\[([HML?])\]\s+(.+?)\s*$", re.M)
+_PYRUN_INPUT_RE = re.compile(r"^\s+\[HIGH\] line (\d+): (.+?)  \((.+)\)\s*$")
+_PYRUN_DERIVED_RE = re.compile(r"^\s+\[derived-(?:xor|arith)\] \[HIGH\] line (\d+): (.+?)  \((.+)\)\s*$")
+_ASM_CALL_RE = re.compile(r"^\s*(\w+\([^)\n]*\)) -> ((?:eax|rax|w0|x0) = .+?)\s*$", re.M)
+_ASM_REG_RE = re.compile(r"^\s+(eax|rax|x0)\s+= (0x[0-9a-f]+.*?)\s*$", re.M)
+_CONF_WORD = {"H": "HIGH", "M": "MEDIUM", "L": "LOW", "?": "unknown"}
+MAX_DERIVED_PER_STEP = 6
+
+
+def extract_derived(module: str, out: str, source: str) -> list[Derived]:
+    """Quote supported derived evidence from a sibling's FULL captured output (never from the truncated echo).
+
+    Only formats the siblings really print are recognized: autosolve ``SOLVE``/``HEADLINE DERIVED`` lines,
+    pyrun HIGH ``[candidate-inputs]`` / ``[derived-*]`` lines, asmeval ``f(args) -> eax = ...`` result lines
+    and the ``eax``/``rax``/``x0`` register of a zero-argument run. Nothing is guessed or reformatted.
+    """
+    found: list[Derived] = []
+    if module == "autosolve":
+        m = _AUTO_SOLVE_RE.search(out)
+        if m:
+            found.append(Derived("derived input", m.group(1), source, _CONF_WORD[m.group(2)], f"method {m.group(3)}"))
+        else:
+            h = _AUTO_HEAD_RE.search(out)
+            if h:
+                found.append(Derived("derived input", h.group(2), source, _CONF_WORD[h.group(1)], "autosolve headline"))
+    elif module == "pyrun":
+        section = ""
+        for ln in out.splitlines():
+            if ln.startswith("["):
+                section = ln.split("]", 1)[0] + "]"
+            elif not ln.startswith(" "):
+                section = ""
+            if section == "[candidate-inputs]":
+                m = _PYRUN_INPUT_RE.match(ln)
+                if m:
+                    found.append(Derived("derived input", m.group(2), source, "HIGH", f"{m.group(3)}, line {m.group(1)}"))
+            elif section == "[derived-values]":
+                m = _PYRUN_DERIVED_RE.match(ln)
+                if m:
+                    found.append(Derived("derived value", m.group(2), source, "HIGH", f"{m.group(3)}, line {m.group(1)}"))
+    elif module == "asmeval":
+        calls = list(_ASM_CALL_RE.finditer(out))
+        for m in calls:
+            partial = "[PARTIAL" in m.group(2)
+            found.append(Derived("register result", f"{m.group(1)} -> {m.group(2)}", source,
+                                 "PARTIAL" if partial else "complete", "value as printed; not a flag"))
+        if not calls:
+            m = _ASM_REG_RE.search(out)
+            if m:
+                partial = "PARTIAL RESULT" in out
+                found.append(Derived("register result", f"{m.group(1)} = {m.group(2)}", source,
+                                     "PARTIAL" if partial else "complete", "return register, no --arg; not a flag"))
+    return found[:MAX_DERIVED_PER_STEP]
+
+
 class _Capture(io.TextIOWrapper):
     """Text sink that also exposes ``.buffer`` (some modules write bytes to sys.stdout.buffer)."""
 
@@ -105,6 +175,10 @@ class Runner:
         self.say = out
         self.results: list[StepResult] = []
         self.cands: dict[str, Candidate] = {}
+        self.derived: list[Derived] = []
+        self.kinds: list[str] = []          # detected input kinds, for the next-step hint
+        self.text_only = False              # --text given
+        self.text_tokens: list[str] = []    # long base64-looking tokens seen in --text (display-only hint)
 
     # ---- candidates -------------------------------------------------------------------------
     def add_text(self, text: str, source: str) -> None:
@@ -161,6 +235,9 @@ class Runner:
                 status = f"exit {rc}"
         res = StepResult(full, status, out, time.monotonic() - start)
         self.add_text(out, full)
+        for d in extract_derived(module, out, full):
+            if not any(d.kind == x.kind and d.text == x.text for x in self.derived):
+                self.derived.append(d)
         return self._finish(res)
 
     def _finish(self, res: StepResult) -> StepResult:
@@ -171,7 +248,7 @@ class Runner:
         for ln in shown:
             self.say("    " + ln[:240])
         if len(shown) < len(lines):
-            self.say(f"    ... {len(lines) - len(shown)} more line(s) (use -v)")
+            self.say(f"    ... {len(lines) - len(shown)} more line(s) (use -v to see them all)")
         return res
 
     def note(self, label: str, status: str, output: str = "") -> None:
@@ -279,6 +356,13 @@ def extract_and_scan(run: Runner, path: str, tag: str) -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+PY_NOTICE = (
+    "!!! NOTICE: the next step RUNS this Python file (pyrun --run --auto-input, guarded, no --force).\n"
+    "!!! Review the code first. Non-hostile CTF scripts only. The sandbox is NOT a security boundary.\n"
+    "!!! Network is blocked; pyrun refuses scripts its scan flags (network, subprocess, obfuscation)."
+)
+
+
 def chain_file(run: Runner, path: str, arg_vals: list[str]) -> None:
     """Run the full chain for one file."""
     tag = os.path.basename(path)
@@ -290,6 +374,8 @@ def chain_file(run: Runner, path: str, arg_vals: list[str]) -> None:
         run.note(f"read [{tag}]", f"error: {exc.strerror or exc}")
         return
     kind = detect_kind(path, data, run.mods)
+    if kind not in run.kinds:
+        run.kinds.append(kind)
     run.say(f"=== {path}: detected {kind} ({size} bytes)")
     run.step("triage", "triage", [path], tag)
     if kind == "java":
@@ -302,6 +388,7 @@ def chain_file(run: Runner, path: str, arg_vals: list[str]) -> None:
             run.step("asmeval --arg", "asmeval", argv, tag)
         run.step("asmeval", "asmeval", [path], tag)
     elif kind == "py":
+        run.say(PY_NOTICE)
         pt = max(1.0, run.step_timeout * 0.75)  # let pyrun time out (and clean up its child) before go does
         run.step("pyrun --run --auto-input", "pyrun",
                  [path, "--run", "--auto-input", "--timeout", f"{pt:g}"], tag)
@@ -322,9 +409,19 @@ def chain_file(run: Runner, path: str, arg_vals: list[str]) -> None:
             run.step("decode -f", "decode", ["-f", path], tag)
 
 
+B64_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/_-]{12,}={0,2}(?![A-Za-z0-9+/=_-])")
+
+
+def _looks_encoded(tok: str) -> bool:
+    """Mechanical check only: long, mixed letters+digits or '='/'+'/'/' padding; used for a display-only hint."""
+    return any(c.isdigit() for c in tok) and any(c.isalpha() for c in tok) or tok.endswith("=")
+
+
 def chain_text(run: Runner, text: str) -> None:
     """Challenge-description chain: decode the text, then decode -f each flag-shaped token alone."""
     run.say("=== --text description")
+    run.text_only = True
+    run.text_tokens = [t for t in dict.fromkeys(B64_TOKEN_RE.findall(text)) if _looks_encoded(t)][:3]
     run.step("decode (text)", "decode", [text], "text")
     seen: set[str] = set()
     for m in TOKEN_RE.finditer(text):
@@ -365,19 +462,64 @@ def rank(cands: dict[str, Candidate]) -> list[tuple[int, Candidate]]:
     return scored
 
 
+NEXT_STEPS = {
+    "java": "vaultdoor <file> (VaultDoor*.java checkers), decode, crypto",
+    "asm": "asmeval <file> --func NAME --arg N (see its -h); numeric register values may need wrapping in the contest's flag format by hand",
+    "py": "pyrun <file> (read-only scan, no --run), revauto <file>, decode",
+    "elf": "autosolve <file> --deep (or autosolve -h), disasm entry <file>, revauto <file> --deep, binextras",
+    "pcap": "forensics <file> --http, stego, decode",
+    "blob": "stego <file> --lsb, forensics <file>, binextras",
+    "archive": "binextras extract (look at every member), forensics, decode",
+    "text": "decode -f <file>, crypto (classic ciphers), hashid id <hash>",
+}
+
+
+def _next_step_hint(run: Runner) -> list[str]:
+    """Short, static hints naming existing modules for the input kinds seen. Display only."""
+    lines = ["NEXT STEPS: no flag-shaped answer was found. That is not a failure of your setup; try one of:"]
+    for k in run.kinds:
+        if k in NEXT_STEPS:
+            lines.append(f"  - {k}: {NEXT_STEPS[k]}")
+    if run.text_only:
+        lines.append("  - pasted text: the tool does NOT understand prose. If a base64/hex token is hiding in it, copy ONLY that")
+        lines.append('    token:  go --text "<token only>"   or   decode "<token>"')
+        for t in run.text_tokens:
+            lines.append(f"    possible encoded token: {t[:60]}{'...' if len(t) > 60 else ''}   (not decoded here; display-only hint)")
+    lines.append("  - rerun go with -v (a go option, not for other modules) to see the step output that was cut off; read the whole log, not just this summary.")
+    return lines
+
+
 def report(run: Runner) -> int:
-    """Print the FLAG CANDIDATES and STEPS sections; return the exit code."""
+    """Print FLAG CANDIDATES, DERIVED INPUTS / REGISTER RESULTS, STEPS and a closing hint; return the exit code."""
     run.say("\n== FLAG CANDIDATES ==")
     ranked = rank(run.cands)
     if not ranked:
-        run.say("(none)")
+        if run.derived:
+            run.say("(none flag-shaped) - BUT derived evidence WAS found: read the next section.")
+        else:
+            run.say("(none)")
     for i, (score, c) in enumerate(ranked, 1):
         run.say(f"{i:>2}. {c.text}   [score {score}]")
         for s in c.sources:
             run.say(f"      seen by: {s}")
+    if run.derived:
+        run.say("\n== DERIVED INPUTS / REGISTER RESULTS ==")
+        run.say("(exact text quoted from the step output; these are NOT flags: verify them, e.g. type a derived input into the")
+        run.say(" program, or wrap a register value in the contest's flag format by hand)")
+        for i, d in enumerate(run.derived, 1):
+            run.say(f"{i:>2}. {d.text}")
+            run.say(f"      {d.kind} [{d.conf}] from {d.source}" + (f" ({d.note})" if d.note else ""))
     run.say("\n== STEPS ==")
+    run.say("(ok = the tool ran, NOT that it solved anything; -v shows step output that was cut off)")
     for r in run.results:
         run.say(f"{r.status:<28} {r.label}")
+    if not ranked:
+        run.say("")
+        if run.derived:
+            run.say("NEXT: no flag-shaped token, but DERIVED INPUTS / REGISTER RESULTS above hold evidence. Use it; do not stop here.")
+        else:
+            for ln in _next_step_hint(run):
+                run.say(ln)
     return 0 if ranked else 1
 
 
@@ -554,6 +696,22 @@ def selftest() -> bool:
         check(r2.step("x", "missing", []).status.startswith("unavailable"), "missing module recorded")
         r3 = Runner({}, 1, 0.0, False, out=lambda s: None)
         check(r3.step("x", "missing", []).status.startswith("skipped"), "budget exhaustion recorded")
+
+        # derived evidence stays visible in the final summary even when the step echo truncates it
+        fake_auto = type("A", (), {"NAME": "autosolve", "run": staticmethod(lambda a: print(
+            "\n".join(["autosolve: x"] + [f"NOISE   line {i}" for i in range(30)] +
+                       ["HEADLINE   DERIVED [H]  s3cr3t_pw",
+                        "SOLVE      s3cr3t_pw  [H]  method strcmp-literal  re-walk ok"])) or 0)})
+        r = Runner({"autosolve": fake_auto}, 5, 30, False, out=lambda s: None)  # type: ignore[dict-item]
+        r.step("autosolve", "autosolve", ["x"])
+        lines: list[str] = []
+        r.say = lines.append
+        rc = report(r)
+        text = "\n".join(lines)
+        check(rc == 1 and "== DERIVED INPUTS / REGISTER RESULTS ==" in text and "s3cr3t_pw" in text and "[HIGH]" in text
+              and "(none)" not in text.split("== DERIVED")[0] and "NEXT:" in text, "derived password in summary")
+        a = extract_derived("asmeval", "check(0x5) -> eax = 0x2a  decimal 42\n", "asmeval")
+        check(len(a) == 1 and "eax = 0x2a" in a[0].text and a[0].conf == "complete", "asmeval register result parsed")
 
         rc, _ = _go([])
         check(rc == 2, "no arguments -> usage exit 2")

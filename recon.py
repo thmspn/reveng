@@ -15,7 +15,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from modules import IMPORT_ERRORS, discover  # noqa: E402
+from modules import IMPORT_ERRORS, discover, ui  # noqa: E402
 
 
 def selftest(mods: dict) -> int:
@@ -52,14 +52,66 @@ def run_module(mod, args: list[str]) -> int:
     return rc if isinstance(rc, int) else 0
 
 
+# Display-only grouping for the menu; numbers still follow registry order. Unlisted modules land in "Other".
+CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("REVERSE / PWN", ("triage", "disasm", "elfpatch", "asmeval", "binextras", "pwnhelp",
+                       "shellcode", "gdbkit", "apk", "vaultdoor", "pyrun")),
+    ("CRYPTO / HASH", ("crypto", "hashid", "decode")),
+    ("FORENSICS / STEGO", ("forensics", "stego")),
+    ("WEB", ("webkit",)),
+    ("AUTOMATION", ("go", "autosolve", "revauto", "batch")),
+    ("REFERENCE", ("exploitnotes",)),
+)
+
+
+def print_menu(mods: dict, guide: bool = True) -> None:
+    """Print the categorized menu. Numbers follow registry order, so choices are unchanged.
+
+    The full START HERE panel is shown on first display; later redraws show a compact reminder.
+    """
+    names = list(mods)
+    number = {name: i for i, name in enumerate(names, 1)}
+    width = max([len(n) for n in names] + [10]) + 1
+    listed = {n for _, members in CATEGORIES for n in members}
+    groups = [(title, [n for n in members if n in mods]) for title, members in CATEGORIES]
+    groups.append(("OTHER", [n for n in names if n not in listed]))
+    print()
+    print(ui.header("RE TOOLKIT"))
+    print(ui.start_here() if guide else ui.start_here_short())
+    print()
+    for title, members in groups:
+        if not members:
+            continue
+        print(ui.category(title))
+        for name in members:
+            print(ui.menu_row(str(number[name]), name, mods[name].DESCRIPTION, width))
+        print()
+    print(ui.category("SPECIAL"))
+    print(ui.menu_row("q", "quit", "exit the toolkit", width))
+
+
+def path_hint(argline: str, args: list[str], rc: int, module: str = "") -> str:
+    """Display-only advice after a failed run when an unquoted path with spaces may have been split."""
+    if rc == 0 or len(args) < 2 or '"' in argline or "'" in argline:
+        return ""
+    for i in range(len(args)):
+        for j in range(i + 1, len(args)):
+            joined = " ".join(args[i:j + 1])
+            if os.path.exists(joined):
+                return f'"{joined}" exists but was split at the spaces: quote the ENTIRE path, e.g. "{joined}"'
+    if rc == 2 and args[0] != module:
+        return 'hint: if a path contains spaces, quote the ENTIRE path, e.g. "my folder/chall bin"'
+    return ""
+
+
 def menu(mods: dict) -> int:
     """Interactive numbered menu; empty input or 'q' quits."""
     names = list(mods)
+    print(ui.banner())
+    first = True
     while True:
-        print("\n=== RE toolkit ===")
-        for i, name in enumerate(names, 1):
-            print(f"  {i}. {name:<10} {mods[name].DESCRIPTION}")
-        print("  q. quit")
+        print_menu(mods, guide=first)
+        first = False
         try:
             choice = input("select> ").strip()
         except EOFError:
@@ -71,8 +123,13 @@ def menu(mods: dict) -> int:
         elif choice in mods:
             name = choice
         else:
-            print("invalid choice")
+            if choice.lower() in ("help", "?"):
+                print(ui.start_here())
+            print(ui.warning("invalid choice: type a module name (e.g. go) or its number from the list, or q to quit"))
             continue
+        print(ui.module_guide(name, mods[name].DESCRIPTION))
+        if name == "go":
+            print(ui.go_warning())
         try:
             argline = input(f"{name} args> ")
         except EOFError:
@@ -80,9 +137,17 @@ def menu(mods: dict) -> int:
         try:
             args = shlex.split(argline)
         except ValueError as exc:  # e.g. unbalanced quotes
-            print(f"error: {exc}")
+            print(ui.error(f"error: {exc}"))
             continue
-        run_module(mods[name], args)
+        if args and args[0] == name:
+            print(ui.info(f"hint: you typed the module name '{name}' at args>. It is already selected, so args> takes "
+                          "arguments only. Submitted as written; if it fails, retry without it."))
+        rc = run_module(mods[name], args)
+        if name == "batch":
+            print(ui.batch_tip())
+        hint = path_hint(argline, args, rc, name)
+        if hint:
+            print(ui.info(hint))
 
 
 def main(argv: list[str]) -> int:

@@ -15,6 +15,40 @@ process; it runs in a timeout-bounded child) and absent by default. Install it *
 `pip install angr`, or on Kali (PEP 668) `python3 -m venv ~/angr-venv && ~/angr-venv/bin/pip install angr` and then run the
 toolkit with `~/angr-venv/bin/python3 toolkit/recon.py ...`. Without it `autosolve` prints one skip line and everything else is unchanged.
 
+## Beginner quick start
+No knowledge of the scripts is needed. From `toolkit/`, run `python3 recon.py` and read the **START HERE** panel:
+```
+select> go       args> chall.bin                      # one file: detect type, run the right tools
+select> batch    args> challenge_folder               # a whole folder, one table
+select> go       args> --text "pasted challenge text" # a description with no file
+```
+- `select>` takes a module name or number; `args>` takes arguments only, never the module name.
+- Quote paths with spaces: `"my folder/chall bin"`. `-h` at `args>` shows that module's usage.
+- After you pick a module the menu shows what it does and a working example for `args>`.
+- Everything printed is a **candidate to verify**. "No candidate" is not success: it means nothing was found,
+  so try another module. In `go`'s step list, `ok` only means the tool ran, not that it solved anything; `-v`
+  shows step output that was cut off. When nothing is found, `go` ends with next-step hints naming other modules.
+- `go` also prints a separate `== DERIVED INPUTS / REGISTER RESULTS ==` section: exact text quoted from
+  `autosolve` (derived input), `pyrun` (HIGH derived password/value) and `asmeval` (register result), each with
+  its source and confidence. These are **not flags**; verify them. If no flag-shaped token exists but derived
+  evidence does, the summary says so and points there. (Human summary only: step output, flags and exit codes
+  are unchanged: exit 0 if a flag candidate was found, else 1.)
+- **Pasted text:** the tool does not understand prose. If a base64 token is hiding in a description, copy only
+  that token: `go --text "SGVsbG8="` (or `decode "SGVsbG8="`). `go` lists possible encoded tokens as a hint
+  only; it does not decode them for you.
+- **Safety:** the menu only waits for your choice; nothing runs by itself and nothing uses the network. But `go` on a
+  `.py` file, or on a folder containing `.py` files, runs the script through guarded `pyrun --run` (never
+  `--force`): review the code first, use non-hostile CTF scripts only, the sandbox is not a security boundary,
+  the network is blocked, and `pyrun` refuses scripts its scan flags. `go` prints a warning before the prompt
+  and a notice right before that step.
+
+Honest limits: `asmeval` only evaluates a whitelist of instructions; unknown inputs, outside calls or
+unsupported instructions give a **PARTIAL** result, not a guess. Its numeric register values (e.g. `eax = 0x2a`)
+sometimes need manual wrapping in the contest's required flag format, such as `picoCTF{0000002a}`; check the task
+statement. `pyrun` reads a script before anything runs; `--run` is refused when the scan finds
+network/subprocess/obfuscation, executes in a no-network sandbox with resource limits, and is a guard rail for
+non-hostile challenge scripts, not a security boundary.
+
 ## Run
 Run from the `toolkit/` directory (or prefix paths with `toolkit/`).
 ```
@@ -26,6 +60,9 @@ python3 recon.py <module> selftest  # run one module's self-test (`--selftest` a
 python3 recon.py <module> -h        # module usage (exit 0)
 python3 modules/<module>.py [args]  # every module also runs standalone, same CLI
 ```
+The interactive menu is grouped by category with a colored banner and headers (colors only on a TTY with `NO_COLOR` unset; piped and direct CLI output is unchanged).
+UI regression tests (stdlib `unittest`, offline): `python3 -m unittest discover -s tests` from `toolkit/`.
+
 Exit codes everywhere: `0` success, `1` runtime/analysis failure (bad input, file missing, not found),
 `2` usage error. Self-test output: the global run prints one `[PASS]`/`[FAIL]` line per module and
 `N/N modules passed`, exiting non-zero on any failure.
@@ -54,7 +91,7 @@ Exit codes everywhere: `0` success, `1` runtime/analysis failure (bad input, fil
 | asmeval | static x86 + AArch64 assembly evaluator (AT&T + Intel; `.S`/`.asm`, gdb `disassemble`, objdump text): from-scratch interpreter over a whitelist (mov/movzx/movsx, add/sub/imul, xor/and/or/not/neg, shifts/rotates, cmp/test, lea, push/pop, inc/dec, xchg, jcc/jmp, call/ret to in-file targets). AArch64 lane auto-selected for `.S` files with xN/wN registers (picoCTF ARMssembly): x0-x30/w0-w30/sp/NZCV; stp/ldp (pre/post-index), ldr/str, mov/movz/movk/movn, add/sub/adds/subs/cmp (optional shifts), and/orr/eor, lsl/lsr/asr, mul/sdiv/udiv, b/b.cond/cbz/cbnz/bl/ret; `--arg` maps to w0, w1, ... and the result is w0/x0. Unknown inputs stay unknown; unsupported instruction, outside call, unknown-flag branch or step cap (default 100k) -> labelled **PARTIAL** result with last known registers, exit 3. Never assembles or executes. `recon.py asmeval <file> [--arg N ...] [--func NAME] [--init REG=VAL] [--max-steps N] [--regs]` |
 | vaultdoor | static solver for picoCTF vault-door `VaultDoor*.java`: parses the source with a mini Java parser and evaluates `checkPassword` with its own interpreter (int/char/byte wrap, arrays, String/StringBuilder, `parseInt(s, radix)`, `String.format`, Base64, `Arrays.equals`), observes every equality comparison and solves the password per character (literal compares, charAt constraints, permutations, XOR/arith loops, int packing, bit swaps, hex/url/base64 chains). Prints password + `picoCTF{...}` with a confidence tag (HIGH = own evaluator accepts it). No javac/JVM, never runs the source. `recon.py vaultdoor <VaultDoorN.java> [--length N] [--budget SECS]` |
 | pyrun | guarded script-execution lane for "run this Python script" challenges. Phase 1 (default, never executes): AST report of imports, network/subprocess/shell/eval/exec calls, out-of-cwd writes, base64/hex blobs, and statically derived passwords (literal compares, folded chr/ord/arithmetic, `str_xor`-style decrypt) with HIGH/MEDIUM/LOW tags. Phase 2 (`--run`): REFUSES (exit 2) on network/subprocess/shell/out-of-cwd-write/obfuscated-import findings or a syntax error (`--force` overrides with a loud warning, never the network block); runs in a child interpreter in a fresh tempdir with socket monkeypatch, CPU/AS/FSIZE rlimits, wall-clock `--timeout` (exit 124); `--input TEXT` / `--auto-input`; `[FLAG?]` scan of output. A guard rail for non-hostile scripts, not a security boundary. `recon.py pyrun <script> [--run] [--force] [--timeout S] [--input T] [--auto-input]` |
-| go | one-command front door: `recon.py go <file-or-dir> [--arg N ...] [--text "description"] [--step-timeout S] [--budget S] [-v]`. Always runs `triage` first, then routes by type (`.java` -> vaultdoor; asm text -> asmeval with `--arg` and zero-arg; `.py` -> `pyrun --run --auto-input`, never `--force`; ELF -> autosolve + revauto; pcap -> forensics; PNG/JPEG/PDF/data -> forensics + `binextras extract` into a fresh tempdir with every extracted file flag-scanned raw and as utf-16-le; archives -> extract; text -> `decode -f` up to 200KB). `--text` runs `decode` on the description and `decode -f` on each flag-shaped token. In-process via the registry, per-step timeout (default 20s) and total budget (default 180s). Ends with a ranked, deduped `== FLAG CANDIDATES ==` list tagged by step, then one status line per step; exit 0 if any candidate, else 1. |
+| go | one-command front door: `recon.py go <file-or-dir> [--arg N ...] [--text "description"] [--step-timeout S] [--budget S] [-v]`. Always runs `triage` first, then routes by type (`.java` -> vaultdoor; asm text -> asmeval with `--arg` and zero-arg; `.py` -> `pyrun --run --auto-input`, never `--force`; ELF -> autosolve + revauto; pcap -> forensics; PNG/JPEG/PDF/data -> forensics + `binextras extract` into a fresh tempdir with every extracted file flag-scanned raw and as utf-16-le; archives -> extract; text -> `decode -f` up to 200KB). `--text` runs `decode` on the description and `decode -f` on each flag-shaped token. In-process via the registry, per-step timeout (default 20s) and total budget (default 180s). Ends with a ranked, deduped `== FLAG CANDIDATES ==` list tagged by step, a `== DERIVED INPUTS / REGISTER RESULTS ==` section (exact autosolve/pyrun/asmeval evidence with source and confidence; not flags), then one status line per step and, if nothing was found, next-step hints; exit 0 if any flag candidate, else 1. |
 
 ## Adding a module
 Drop `modules/<name>.py` defining `NAME`, `DESCRIPTION`, `run(args) -> int`, `selftest() -> bool`.
