@@ -511,7 +511,7 @@ def _default(raw: bytes, text: str, ns, candidate_sink=None) -> None:
         for cand in ws:
             _record_candidates(cand, False, candidate_sink)
             print(f"  {_show(cand)}")
-            for m in re.findall(rb"[A-Za-z0-9_\-]{2,24}\{[\x21-\x7a\x7c\x7e]{1,200}\}", cand):
+            for m in _RESULT_FLAG_RE.findall(cand):
                 print(f"  [FLAG?] {m.decode('ascii', 'replace')}")
         if any(plaintext_like(cand) for cand in ws):
             return

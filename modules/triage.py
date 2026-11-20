@@ -47,7 +47,7 @@ DF_BIND_NOW, DF_1_NOW = 0x8, 0x1
 SHT_NOBITS = 8
 
 
-_FLAG_RE = re.compile(rb"[A-Za-z0-9_\-]{2,24}\{[\x21-\x7a\x7c\x7e]{1,200}\}")
+_FLAG_RE = re.compile(rb"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{1,64}\{[\x20-\x7a\x7c\x7e]{1,200}\}")
 _FLAG_SCAN_CAP = 64 << 20  # bytes scanned for flag-shaped strings
 
 

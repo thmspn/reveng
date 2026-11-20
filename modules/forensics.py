@@ -185,7 +185,7 @@ def strings(data: bytes, minlen: int = 6) -> list[str]:
     return [m.decode("latin-1") for m in re.findall(rb"[\x20-\x7e\t]{%d,}" % minlen, data)]
 
 
-FLAG_RE = re.compile(rb"[A-Za-z0-9_\-]{2,24}\{[\x21-\x7a\x7c\x7e]{1,200}\}")
+FLAG_RE = re.compile(rb"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{1,64}\{[\x20-\x7a\x7c\x7e]{1,200}\}")
 RUN_RE = re.compile(rb"[\x20-\x7e]{6,}")
 MAX_RUNS = 200  # printed per stream; the rest are summarised
 

@@ -31,7 +31,7 @@ DESCRIPTION = "Directory auto-triage: detect each file, route to triage/disasm/f
 
 MAX_READ = 8 * 1024 * 1024      # bytes read per file
 MAX_FILES = 2000                # files examined per run
-FLAG_RE = re.compile(rb"[A-Za-z0-9_]{2,12}\{[A-Za-z0-9_\-!@#$%^&*+=.,:;?/\\ ]{3,200}\}")
+FLAG_RE = re.compile(rb"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{1,64}\{[\x20-\x7a\x7c\x7e]{1,200}\}")
 USAGE = """batch usage:
   recon.py batch <dir|file> [--quick] [--json] [-r]
     --quick   skip disassembly (faster)

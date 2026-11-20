@@ -34,7 +34,7 @@ select> go       args> --text "pasted challenge text" # a description with no fi
   evidence does, the summary says so and points there. (Human summary only: step output, flags and exit codes
   are unchanged: exit 0 if a flag candidate was found, else 1.)
 - **Candidate scores are not proof:** `go` recognizes `prefix{body}` without a contest-name allowlist
-  (prefix: 1-64 ASCII letters/digits/underscores/hyphens; body: 1-200 characters, no braces or line breaks).
+  (prefix: 1-64 ASCII letters/digits/underscores/hyphens; body: 1-200 printable ASCII characters, no braces or line breaks).
   Literal `--text` tokens and tokens actually found in module/codec results get +100. Speculative
   ROT/Atbash/XOR guesses do not, even if their prefix says `flag` or `picoCTF`. Decoder candidates use a
   structured callback, never headings or truncated previews from the human log. A simple body gets +3,
@@ -43,8 +43,10 @@ select> go       args> --text "pasted challenge text" # a description with no fi
   labelled. An unfamiliar prefix is not evidence of gibberish, and a familiar one is not proof of a flag.
   A ROT-encrypted flag can still look flag-shaped before decryption, so inspect the cipher guesses too;
   scores cannot identify the right rotation from shape alone. Bare hashes, numeric answers and other
-  unwrapped formats are not automatically flags. Other modules have their own format/length limits;
-  `autosolve` and `revauto` offer `--flag-format` for a contest-specific regex.
+  unwrapped formats are not automatically flags. The operational scanners in go, batch, triage,
+  decode results, forensics, binextras and crypto use the same bounds; pyrun, autosolve and revauto
+  inherit batch's pattern. `autosolve` and `revauto` also offer `--flag-format` for a contest-specific regex.
+  decode's ROT language-ranking heuristic remains separate from candidate detection.
 - **Pasted text:** the tool does not understand prose, but it now tries embedded base64/hex-shaped
   tokens in descriptions and ordinary text files. This is bounded to eight distinct tokens, 12-4096
   alphabet characters each (plus base64 padding), within the first 200KiB. If a blob is missed or a limit is reported, copy ONLY that

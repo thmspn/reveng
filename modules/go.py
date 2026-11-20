@@ -54,7 +54,7 @@ SHOW_LINES = 12                      # captured lines echoed per step without -v
 SKIP_NAMES = {".placeholder", ".ignore"}
 
 # flag-shaped token as written in the task: used on descriptions and on captured step output.
-TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{1,64}\{[^{}\r\n]{1,200}\}")
+TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{1,64}\{[\x20-\x7a\x7c\x7e]{1,200}\}")
 TOKEN_LINE_RE = TOKEN_RE
 TOKEN_BYTES_RE = re.compile(rb"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{1,64}\{[\x20-\x7a\x7c\x7e]{1,200}\}")
 ASM_TEXT_RE = re.compile(
