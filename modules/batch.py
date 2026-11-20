@@ -100,7 +100,15 @@ def _list_archive(data: bytes) -> tuple[list[str], bytes]:
 
 def _kw_hits(forensics: ModuleType, data: bytes) -> tuple[list[str], list[str]]:
     """Return (flag-like strings, keyword names) found in data."""
-    flags = sorted({m.group().decode("latin-1") for m in FLAG_RE.finditer(data)})[:5]
+    found = {m.group().decode("latin-1") for m in FLAG_RE.finditer(data)}
+    if b"\x00" in data:
+        # Decode both byte alignments, not just alternate byte lanes: arbitrary
+        # binary bytes must not turn into ASCII by dropping every second byte.
+        text_re = re.compile(FLAG_RE.pattern.decode("ascii"))
+        for skew in (0, 1):
+            wide = data[skew:len(data) - ((len(data) - skew) % 2)].decode("utf-16-le", "ignore")
+            found.update(m.group() for m in text_re.finditer(wide))
+    flags = sorted(found)[:5]
     kws = sorted({k for k, _ in forensics.find_keywords(data, 0)})[:8]
     return flags, kws
 

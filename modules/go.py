@@ -12,7 +12,8 @@ Chain (siblings are called in-process through the registry; their stdout is capt
     pcap/pcapng    forensics
     PNG/JPEG/PDF/data blob   forensics + binextras extract into a fresh tempdir, every extracted file is
                    flag-scanned (raw bytes and utf-16-le decode)
-    zip/tar/gzip   binextras extract + the same scan of extracted files
+    zip/gzip       binextras extract + the same scan of extracted files
+    tar/bzip2/xz/7z/rar   explicit manual-extraction notice (no extraction attempted)
     text/unknown   decode -f (files over 200KB skipped)
     --text / -t    decode on the description, bounded embedded blobs, then each flag-shaped token alone
 
@@ -300,6 +301,8 @@ def _call_with_timeout(fn: Callable[[], object], seconds: float) -> object:
 
 def detect_kind(path: str, data: bytes, mods: dict[str, ModuleType]) -> str:
     """Return one of java/asm/py/elf/pcap/blob/archive/text, from extension first, then content."""
+    if data.startswith((b"BZh", b"\xfd7zXZ\x00", b"7z\xbc\xaf\x27\x1c", b"Rar!\x1a\x07")) or data[257:263] in (b"ustar\x00", b"ustar "):
+        return "archive-manual"
     ext = os.path.splitext(path)[1].lower()
     if ext == ".java":
         return "java"
@@ -410,6 +413,10 @@ def chain_file(run: Runner, path: str, arg_vals: list[str]) -> None:
         extract_and_scan(run, path, tag)
     elif kind == "archive":
         extract_and_scan(run, path, tag)
+    elif kind == "archive-manual":
+        run.note(f"archive extraction [{tag}]", "skipped: unsupported archive/compression",
+                 "Automatic extraction supports ZIP/GZIP only. Extract this archive manually into a fresh folder, "
+                 "inspect the members, then run go on a selected file or batch on that folder. Nothing was extracted here.")
     else:
         if size > DECODE_MAX_BYTES:
             run.note(f"decode -f [{tag}]", f"skipped: file over {DECODE_MAX_BYTES // 1024}KB")
@@ -509,6 +516,7 @@ NEXT_STEPS = {
     "pcap": "forensics <file> --http, stego, decode",
     "blob": "stego <file> --lsb, forensics <file>, binextras",
     "archive": "binextras extract (look at every member), forensics, decode",
+    "archive-manual": "unsupported archive/compression: extract manually into a fresh folder, inspect the members, then go <file> or batch <folder>; automatic extraction supports ZIP/GZIP only",
     "text": "decode -f <file>, crypto (classic ciphers), hashid id <hash>",
 }
 
