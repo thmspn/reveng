@@ -523,6 +523,9 @@ def _default(raw: bytes, text: str, ns, candidate_sink=None) -> None:
         print(f"  result: {_show(final)}")
     else:
         print("  no encoding layer detected")
+    # Keep full tokens visible even when the readable result preview is truncated.
+    for token in dict.fromkeys(m.group(0) for m in _RESULT_FLAG_RE.finditer(final)):
+        print(f"  [FLAG?] {token.decode('ascii')}")
     if plaintext_like(final):
         return
     if printable_ratio(final) >= 0.95:

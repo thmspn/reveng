@@ -14,7 +14,7 @@ Chain (siblings are called in-process through the registry; their stdout is capt
                    flag-scanned (raw bytes and utf-16-le decode)
     zip/tar/gzip   binextras extract + the same scan of extracted files
     text/unknown   decode -f (files over 200KB skipped)
-    --text / -t    decode on the description, plus decode -f on each flag-shaped token alone
+    --text / -t    decode on the description, bounded embedded blobs, then each flag-shaped token alone
 
 Every step has a wall-clock timeout (--step-timeout, default 20s) and the whole run a budget (--budget,
 default 180s). Output ends with "== FLAG CANDIDATES ==" (deduped, ranked, each tagged with the step that
@@ -415,9 +415,11 @@ def chain_file(run: Runner, path: str, arg_vals: list[str]) -> None:
             run.note(f"decode -f [{tag}]", f"skipped: file over {DECODE_MAX_BYTES // 1024}KB")
         else:
             run.step("decode -f", "decode", ["-f", path], tag)
+            decode_embedded(run, data.decode("utf-8", "replace"), tag)
 
 
-B64_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/_-]{12,}={0,2}(?![A-Za-z0-9+/=_-])")
+EMBEDDED_TOKEN_LIMIT = 8
+B64_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/_-]{12,4096}={0,2}(?![A-Za-z0-9+/=_-])")
 
 
 def _looks_encoded(tok: str) -> bool:
@@ -425,13 +427,39 @@ def _looks_encoded(tok: str) -> bool:
     return any(c.isdigit() for c in tok) and any(c.isalpha() for c in tok) or tok.endswith("=")
 
 
+def decode_embedded(run: Runner, text: str, tag: str) -> None:
+    """Try bounded embedded base64/hex-shaped tokens using the existing decoder.
+
+    Whole-input decoding is already done. No token contents become a filename or
+    an option: a leading '-' is explicitly separated from argparse options.
+    """
+    seen: set[str] = set()
+    count = 0
+    scan = text.encode("utf-8", "replace")[:DECODE_MAX_BYTES].decode("utf-8", "ignore")
+    for match in B64_TOKEN_RE.finditer(scan):
+        token = match.group(0)
+        if match.end() == len(scan) and len(scan) < len(text) and text[len(scan)] in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-":
+            continue  # the 200KiB boundary cut through a longer token
+        if token in seen:
+            continue
+        seen.add(token)
+        if token == text.strip():
+            continue
+        if count >= EMBEDDED_TOKEN_LIMIT:
+            run.note(f"embedded tokens [{tag}]", "skipped: token limit reached; paste a remaining token alone")
+            break
+        count += 1
+        run.step(f"decode embedded token {count}", "decode", ["--", token], tag)
+
+
 def chain_text(run: Runner, text: str) -> None:
-    """Challenge-description chain: decode the text, then decode -f each flag-shaped token alone."""
+    """Decode whole text, bounded embedded blobs, then each literal flag-shaped token."""
     run.say("=== --text description")
     run.text_only = True
     run.add_text(text, "literal --text input")
     run.text_tokens = [t for t in dict.fromkeys(B64_TOKEN_RE.findall(text)) if _looks_encoded(t)][:3]
-    run.step("decode (text)", "decode", [text], "text")
+    run.step("decode (text)", "decode", ["--", text], "text")
+    decode_embedded(run, text, "text")
     seen: set[str] = set()
     for m in TOKEN_RE.finditer(text):
         tok = m.group(0)
@@ -492,10 +520,10 @@ def _next_step_hint(run: Runner) -> list[str]:
         if k in NEXT_STEPS:
             lines.append(f"  - {k}: {NEXT_STEPS[k]}")
     if run.text_only:
-        lines.append("  - pasted text: the tool does NOT understand prose. If a base64/hex token is hiding in it, copy ONLY that")
+        lines.append("  - pasted text: the tool does NOT understand prose. Embedded-token scanning is bounded; copy ONLY that")
         lines.append('    token:  go --text "<token only>"   or   decode "<token>"')
         for t in run.text_tokens:
-            lines.append(f"    possible encoded token: {t[:60]}{'...' if len(t) > 60 else ''}   (not decoded here; display-only hint)")
+            lines.append(f"    possible encoded token: {t[:60]}{'...' if len(t) > 60 else ''}   (if missing from results, try this token alone)")
     lines.append("  - rerun go with -v (a go option, not for other modules) to see the step output that was cut off; read the whole log, not just this summary.")
     return lines
 
@@ -552,6 +580,13 @@ def run(args: list[str]) -> int:
     p.add_argument("--step-timeout", type=float, default=DEFAULT_STEP_TIMEOUT, help="seconds per step (default 20)")
     p.add_argument("--budget", type=float, default=DEFAULT_BUDGET, help="total seconds (default 180)")
     p.add_argument("-v", "--verbose", action="store_true", help="echo all captured step output")
+    # --text owns the following argument even when it begins with '-'.
+    # Preserve the usual missing-value error when no following argument exists.
+    args = list(args)
+    for i, arg in enumerate(args[:-1]):
+        if arg in ("--text", "-t"):
+            args[i:i + 2] = [arg + "=" + args[i + 1]]
+            break
     try:
         ns = p.parse_args(args)
     except SystemExit as exc:

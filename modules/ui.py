@@ -145,7 +145,7 @@ def start_here() -> str:
         "  One file:     select> go       then  args> chall.bin",
         "  A folder:     select> batch    then  args> challenge_folder",
         '  Pasted text:  select> go       then  args> --text "paste the challenge text"',
-        "                (paste ONLY an encoded token; prose around it hides it)",
+        "                (prefer ONLY an encoded token; prose gets a bounded blob scan)",
         "  select> takes a module name or number (q quits).",
         "  args> takes arguments only, not the command (type  go chall  and it fails).",
         '  Quote paths with spaces: "my folder/chall bin".',

@@ -35,9 +35,9 @@ select> go       args> --text "pasted challenge text" # a description with no fi
   are unchanged: exit 0 if a flag candidate was found, else 1.)
 - **Candidate scores are not proof:** `go` recognizes `prefix{body}` without a contest-name allowlist
   (prefix: 1-64 ASCII letters/digits/underscores/hyphens; body: 1-200 characters, no braces or line breaks).
-  Literal `--text` tokens and tokens actually found in module/codec results get +100; speculative
-  Decoder candidates use a structured callback, never headings or truncated previews from the human log.
-  ROT/Atbash/XOR guesses do not, even if their prefix says `flag` or `picoCTF`. A simple body gets +3,
+  Literal `--text` tokens and tokens actually found in module/codec results get +100. Speculative
+  ROT/Atbash/XOR guesses do not, even if their prefix says `flag` or `picoCTF`. Decoder candidates use a
+  structured callback, never headings or truncated previews from the human log. A simple body gets +3,
   other bodies -3, on a base of 10; each additional source adds 5. Speculative-only source bonuses
   stop at +20 (maximum speculative score 33), so repeated guesses cannot outrank actual results. Cipher guesses remain visible and
   labelled. An unfamiliar prefix is not evidence of gibberish, and a familiar one is not proof of a flag.
@@ -45,9 +45,11 @@ select> go       args> --text "pasted challenge text" # a description with no fi
   scores cannot identify the right rotation from shape alone. Bare hashes, numeric answers and other
   unwrapped formats are not automatically flags. Other modules have their own format/length limits;
   `autosolve` and `revauto` offer `--flag-format` for a contest-specific regex.
-- **Pasted text:** the tool does not understand prose. If a base64 token is hiding in a description, copy only
-  that token: `go --text "SGVsbG8="` (or `decode "SGVsbG8="`). `go` lists possible encoded tokens as a hint
-  only; it does not decode them for you.
+- **Pasted text:** the tool does not understand prose, but it now tries embedded base64/hex-shaped
+  tokens in descriptions and ordinary text files. This is bounded to eight distinct tokens, 12-4096
+  alphabet characters each (plus base64 padding), within the first 200KiB. If a blob is missed or a limit is reported, copy ONLY that
+  token: `go --text "SGVsbG8="` (or `decode "SGVsbG8="`). Token hints are not proof of a decode.
+  Whole-input decoding is still tried first. Full decoded flags remain visible even beyond a truncated preview.
 - **Safety:** the menu only waits for your choice; nothing runs by itself and nothing uses the network. But `go` on a
   `.py` file, or on a folder containing `.py` files, runs the script through guarded `pyrun --run` (never
   `--force`): review the code first, use non-hostile CTF scripts only, the sandbox is not a security boundary,

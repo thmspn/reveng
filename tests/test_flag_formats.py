@@ -38,14 +38,14 @@ class FlagFormats(unittest.TestCase):
             self.assertFalse(r.cands[flag].speculative_only)
             self.assertNotIn('word{...}', r.cands)
 
-    def test_embedded_encoded_blob_still_requires_token_only(self):
-        # Do not silently expand a scoring fix into an embedded-token decoder.
+    def test_embedded_encoded_blob_is_decoded(self):
         for prefix in ('flag', 'CTF', 'cybersci', 'CyberSci', 'HTB', 'FreshEvent'):
             r = self.runner()
             flag = prefix + '{novice_b64_ok}'
             token = base64.b64encode(flag.encode()).decode()
             go.chain_text(r, 'We intercepted ' + token + ' please decode it.')
-            self.assertNotIn(flag, r.cands)
+            self.assertIn(flag, r.cands)
+            self.assertEqual(go.rank(r.cands)[0][0], 113)
             self.assertIn(token, r.text_tokens)
             self.assertIn('ONLY that', '\n'.join(go._next_step_hint(r)))
 
