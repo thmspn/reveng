@@ -234,6 +234,15 @@ def rot(text: str, shift: int) -> str:
 
 
 _FLAG_RE = re.compile(r"[A-Za-z][A-Za-z0-9]{2,9}\{[ -~]{4,80}\}")
+_RESULT_FLAG_RE = re.compile(rb"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{1,64}\{[\x20-\x7a\x7c\x7e]{1,200}\}")
+
+
+def _record_candidates(data: bytes, speculative: bool, sink) -> None:
+    """Structured evidence for go, independent of output headings and previews."""
+    if sink is not None:
+        for token in dict.fromkeys(m.group(0) for m in _RESULT_FLAG_RE.finditer(data)):
+            sink(token.decode("ascii"), speculative)
+
 
 
 def rot_bruteforce(text: str) -> list[tuple[float, int, str]]:
@@ -384,7 +393,12 @@ def _parse_key(k: str) -> bytes:
     return k.encode()
 
 
-def run(args: list[str]) -> int:
+def run_candidates(args: list[str], sink) -> int:
+    """Default-decoder entry point for go's structured candidate collection."""
+    return run(args, candidate_sink=sink)
+
+
+def run(args: list[str], *, candidate_sink=None) -> int:
     """CLI entry point (registry contract); returns a process exit code."""
     if args[:1] in (["selftest"], ["--selftest"]):
         return 0 if selftest() else 1
@@ -460,7 +474,7 @@ def run(args: list[str]) -> int:
             for sc, k, pt in xor_bruteforce(data)[:ns.top]:
                 print(f"key 0x{k:02x} ({chr(k) if 32 <= k < 127 else '.'})  score {sc:.3f}  {_show(pt, 100)}")
         else:
-            _default(raw, text, ns)
+            _default(raw, text, ns, candidate_sink)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -485,7 +499,7 @@ def whitespace_binary(text: str) -> list[bytes]:
     return out
 
 
-def _default(raw: bytes, text: str, ns) -> None:
+def _default(raw: bytes, text: str, ns, candidate_sink=None) -> None:
     """'Just works' mode for a pasted blob."""
     print("== hints (heuristic guesses, not certainties) ==")
     for h in hints(text):
@@ -495,6 +509,7 @@ def _default(raw: bytes, text: str, ns) -> None:
     if ws:
         print("\n== whitespace binary (two distinct whitespace chars as bits) ==")
         for cand in ws:
+            _record_candidates(cand, False, candidate_sink)
             print(f"  {_show(cand)}")
             for m in re.findall(rb"[A-Za-z0-9_\-]{2,24}\{[\x21-\x7a\x7c\x7e]{1,200}\}", cand):
                 print(f"  [FLAG?] {m.decode('ascii', 'replace')}")
@@ -503,6 +518,7 @@ def _default(raw: bytes, text: str, ns) -> None:
     print("\n== auto-decode ==")
     final, chain = auto_decode(text, ns.rounds)
     if chain:
+        _record_candidates(final, False, candidate_sink)
         print(f"  chain: {' -> '.join(chain)}")
         print(f"  result: {_show(final)}")
     else:
@@ -512,11 +528,15 @@ def _default(raw: bytes, text: str, ns) -> None:
     if printable_ratio(final) >= 0.95:
         print(f"\n== caesar/rot brute-force (top {min(3, ns.top)}) ==")
         for sc, k, pt in rot_bruteforce(_txt(final))[:3]:
+            _record_candidates(pt.encode("latin-1", "replace"), True, candidate_sink)
             print(f"  rot{k:<2} {sc:.3f}  {pt[:100]}")
-        print(f"  atbash: {atbash(_txt(final))[:100]}")
+        at = atbash(_txt(final))
+        _record_candidates(at.encode("latin-1", "replace"), True, candidate_sink)
+        print(f"  atbash: {at[:100]}")
     else:
         print(f"\n== single-byte XOR brute-force (top {ns.top}) ==")
         for sc, k, pt in xor_bruteforce(final)[:ns.top]:
+            _record_candidates(pt, True, candidate_sink)
             print(f"  key 0x{k:02x}  {sc:.3f}  {_show(pt, 100)}")
 
 

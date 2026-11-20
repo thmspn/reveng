@@ -33,6 +33,18 @@ select> go       args> --text "pasted challenge text" # a description with no fi
   its source and confidence. These are **not flags**; verify them. If no flag-shaped token exists but derived
   evidence does, the summary says so and points there. (Human summary only: step output, flags and exit codes
   are unchanged: exit 0 if a flag candidate was found, else 1.)
+- **Candidate scores are not proof:** `go` recognizes `prefix{body}` without a contest-name allowlist
+  (prefix: 1-64 ASCII letters/digits/underscores/hyphens; body: 1-200 characters, no braces or line breaks).
+  Literal `--text` tokens and tokens actually found in module/codec results get +100; speculative
+  Decoder candidates use a structured callback, never headings or truncated previews from the human log.
+  ROT/Atbash/XOR guesses do not, even if their prefix says `flag` or `picoCTF`. A simple body gets +3,
+  other bodies -3, on a base of 10; each additional source adds 5. Speculative-only source bonuses
+  stop at +20 (maximum speculative score 33), so repeated guesses cannot outrank actual results. Cipher guesses remain visible and
+  labelled. An unfamiliar prefix is not evidence of gibberish, and a familiar one is not proof of a flag.
+  A ROT-encrypted flag can still look flag-shaped before decryption, so inspect the cipher guesses too;
+  scores cannot identify the right rotation from shape alone. Bare hashes, numeric answers and other
+  unwrapped formats are not automatically flags. Other modules have their own format/length limits;
+  `autosolve` and `revauto` offer `--flag-format` for a contest-specific regex.
 - **Pasted text:** the tool does not understand prose. If a base64 token is hiding in a description, copy only
   that token: `go --text "SGVsbG8="` (or `decode "SGVsbG8="`). `go` lists possible encoded tokens as a hint
   only; it does not decode them for you.
